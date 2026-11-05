@@ -60,8 +60,8 @@ export function PlanApproval({ run, isBusy, onApprove }: Props) {
               <>
                 <h3 className="mt-5 text-xs font-semibold tracking-wide text-ink/50">위험</h3>
                 <ul className="mt-2 space-y-2">
-                  {plan.risks.map((r) => (
-                    <li key={r.title} className={`border-l-2 pl-3 text-sm ${RISK_TONE[r.level]}`}>
+                  {plan.risks.map((r, i) => (
+                    <li key={`${r.title}-${i}`} className={`border-l-2 pl-3 text-sm ${RISK_TONE[r.level]}`}>
                       <p className="font-medium">{r.title}</p>
                       {r.detail && <p className="text-ink/60">{r.detail}</p>}
                     </li>
@@ -109,8 +109,8 @@ export function PlanApproval({ run, isBusy, onApprove }: Props) {
               {decision.reason}
               {plan && plan.blocking.length > 0 && (
                 <ul className="mt-1 list-disc pl-5">
-                  {plan.blocking.map((b) => (
-                    <li key={b}>{b}</li>
+                  {plan.blocking.map((b, i) => (
+                    <li key={`${b}-${i}`}>{b}</li>
                   ))}
                 </ul>
               )}
@@ -128,7 +128,7 @@ export function PlanApproval({ run, isBusy, onApprove }: Props) {
               className={INPUT}
             />
             <button type="submit" disabled={!decision.allowed || isBusy} className={`${BUTTON_PRIMARY} shrink-0`}>
-              계획 승인
+              {plan?.approvable === false ? "위험 감수하고 계획 승인" : "계획 승인"}
             </button>
           </div>
         </form>
