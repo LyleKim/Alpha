@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import pytest
 
 from app.features.assessment import app as app_part
-from app.features.assessment import bastion, db, pg_connect, rds, refs, service
+from app.features.assessment import app_hint, bastion, db, pg_connect, rds, refs, service
 from app.features.assessment.schemas import (
     AppAssessment, AppInfo, AssessmentInput, DbAssessment, DbInfo, SourceDb, SourceNetwork,
 )
@@ -36,6 +36,8 @@ def fx(monkeypatch):
     s = {"closed": 0, "catalog": CATALOG, "rds": _rds(), "bastion": (bastion.BastionInfo("i-b", "vpc-1", None, True), None),
          "creds": ({"user": "master", "password": SENTINEL}, None), "exc": None, "args": None}
     monkeypatch.delenv("ALPHA_SOURCE_DB_NAME", raising=False)
+    s["hint"] = None
+    monkeypatch.setattr(app_hint, "pg_database_hint", lambda *a, **k: s["hint"])
     monkeypatch.setattr(rds, "collect_rds", lambda *a, **k: s["rds"])
     monkeypatch.setattr(bastion, "ensure_bastion", lambda *a, **k: s["bastion"])
     monkeypatch.setattr(refs, "db_admin_for", lambda *a, **k: s["creds"])
@@ -127,6 +129,36 @@ def test_explicit_mismatch_not_confirmed(fx, monkeypatch):
     fx["catalog"] = {**CATALOG, "current_database": "other"}
     out = db.collect(INP, object())
     assert out.facts.database_name is None and out.source_db.database is None
+
+
+def test_hint_beats_rds_dbname(fx):
+    fx["hint"] = "apphint"
+    fx["catalog"] = {**CATALOG, "databases": ["apphint", "appdb", "postgres"], "current_database": "apphint"}
+    out = db.collect(INP, object())
+    assert fx["args"][3] == "apphint" and out.facts.database_name == "apphint"
+    assert out.source_db.database == "apphint" and out.gaps == []
+
+
+def test_env_beats_hint(fx, monkeypatch):
+    monkeypatch.setenv("ALPHA_SOURCE_DB_NAME", "appdb")
+    fx["hint"] = "apphint"
+    assert db.collect(INP, object()).facts.database_name == "appdb" and fx["args"][3] == "appdb"
+
+
+def test_no_hint_uses_old_fallback(fx):
+    fx["rds"] = _rds(db_name=None)
+    fx["catalog"] = {**CATALOG, "databases": ["postgres"], "current_database": "postgres"}
+    out = db.collect(INP, object())
+    assert fx["args"][3] == "postgres" and out.facts.database_name == "postgres"
+
+
+def test_hint_db_missing_clears_with_gap(fx):
+    fx["rds"] = _rds(db_name=None)
+    fx["hint"] = "apphint"
+    fx["catalog"] = {**CATALOG, "databases": ["postgres"], "current_database": "postgres"}
+    out = db.collect(INP, object())
+    assert out.facts.database_name is None and out.source_db.database is None and out.facts.tables == []
+    assert any("앱이 쓰는 DB(apphint)를 찾지 못함" in g for g in out.gaps)
 
 
 def test_requested_db_mismatch(fx):

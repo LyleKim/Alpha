@@ -52,7 +52,18 @@ def test_secret_import_error(monkeypatch):
     assert c is None and "미구현" in why
 
 
+def test_env_ref_denied_by_default(monkeypatch):
+    monkeypatch.setenv("SRC_USER", "admin")
+    monkeypatch.setenv("SRC_PASSWORD", PW)
+    monkeypatch.delenv("ALPHA_ALLOW_ENV_REFS", raising=False)
+    c, why = refs.resolve_db_admin("env://SRC")
+    assert c is None and "로컬 개발" in why and "secret://" in why and PW not in why
+    monkeypatch.setenv("ALPHA_ALLOW_ENV_REFS", "true")  # "1" 이 아니면 거부
+    assert refs.resolve_db_admin("env://SRC")[0] is None
+
+
 def test_env_ok_empty_bad_prefix(monkeypatch):
+    monkeypatch.setenv("ALPHA_ALLOW_ENV_REFS", "1")
     monkeypatch.setenv("SRC_USER", "admin")
     monkeypatch.setenv("SRC_PASSWORD", PW)
     assert refs.resolve_db_admin("env://SRC") == ({"user": "admin", "password": PW}, None)
@@ -127,6 +138,7 @@ def test_asm_client_error_code_only():
 
 
 def test_db_admin_for_gate(monkeypatch):
+    monkeypatch.setenv("ALPHA_ALLOW_ENV_REFS", "1")
     sm = FakeSM([["n"]], SEC)
     s = FakeSession(sm)
     monkeypatch.setenv("SRC_USER", "")  # ref 가 있고 틀리면 폴백하지 않음

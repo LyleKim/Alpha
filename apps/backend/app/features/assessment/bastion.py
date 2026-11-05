@@ -142,15 +142,28 @@ def _signal_group(proc, sig) -> None:
             pass
 
 
+def _posix() -> bool:
+    """프로세스 그룹 호출(os.killpg)이 있는 플랫폼(Linux·macOS)인지. Windows 는 False."""
+    return hasattr(os, "killpg")
+
+
 def _stop(proc) -> None:
     # poll() 여부와 무관하게 그룹을 정리한다(aws 가 먼저 죽어도 plugin 자식이 남을 수 있음)
     # aws CLI 는 session-manager-plugin 을 자식으로 띄우므로 프로세스 그룹 전체를 종료한다
-    _signal_group(proc, signal.SIGTERM)
+    # Windows 처럼 killpg 가 없으면 자식 하나만 terminate → kill 로 정리한다(ponytail: plugin 손자 잔존 가능)
+    if _posix():
+        _signal_group(proc, signal.SIGTERM)
+    else:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
     try:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         pass
-    _signal_group(proc, signal.SIGKILL)  # 이미 없으면 ProcessLookupError(OSError) 무시
+    if _posix():
+        _signal_group(proc, signal.SIGKILL)  # 이미 없으면 ProcessLookupError(OSError) 무시
     try:
         proc.kill()
     except OSError:
@@ -196,7 +209,8 @@ def open_tunnel(
     ]
     proc = subprocess.Popen(
         cmd, env=_child_env(session, region), shell=False,
-        stdin=subprocess.DEVNULL, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        **({"start_new_session": True} if _posix() else {}),  # POSIX 만: 그룹 단위 종료용
     )
     try:
         deadline = time.monotonic() + ready_timeout

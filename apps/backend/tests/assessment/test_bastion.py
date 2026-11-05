@@ -112,7 +112,7 @@ def popen(monkeypatch):
         rec["proc"].terminated = True
         rec["proc"].code = 0
 
-    monkeypatch.setattr(bastion.os, "killpg", killpg)
+    monkeypatch.setattr(bastion.os, "killpg", killpg, raising=False)  # Windows 에도 없음
     return rec
 
 
@@ -179,7 +179,8 @@ def test_stop_kills_group_even_if_proc_already_exited(monkeypatch, popen):
         with open_tunnel(FakeSession(), "ap-northeast-2", INFO, HOST, 5432):
             pass
     import signal
-    assert [s for _, s in popen["sigs"]] == [signal.SIGTERM, signal.SIGKILL]
+    sigs = [s for _, s in popen["sigs"]]
+    assert sigs == [signal.SIGTERM, getattr(signal, "SIGKILL", None)]
     assert popen["proc"].closed == ["out", "err"]  # PIPE 닫힘
 
 
@@ -188,3 +189,14 @@ def test_tunnel_rejects_bad_region(popen, region):
     with pytest.raises(BastionError, match="리전"):
         with open_tunnel(FakeSession(), region, INFO, HOST, 5432):
             pass
+
+
+def test_no_killpg_platform_terminates_then_kills(monkeypatch, popen):
+    # Windows 처럼 killpg 가 없는 플랫폼: 그룹 신호 없이 terminate → kill, start_new_session 도 안 넘김
+    monkeypatch.delattr(bastion.os, "killpg", raising=False)
+    monkeypatch.setattr(bastion, "_listening", lambda p: not popen["proc"].terminated)
+    with open_tunnel(FakeSession(), "ap-northeast-2", INFO, HOST, 5432, local_port=15432):
+        pass
+    assert "start_new_session" not in popen["kw"]
+    assert popen["sigs"] == [] and popen["proc"].terminated and popen["proc"].killed
+    assert popen["proc"].closed == ["out", "err"]

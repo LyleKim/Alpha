@@ -70,8 +70,10 @@ python -m app.features.assessment.cli --profile <읽기 전용 프로필> --aws-
 - **환경변수 (모두 선택)**
   | 이름 | 뜻 |
   | --- | --- |
-  | `ALPHA_SOURCE_DB_NAME` | 조회할 앱 DB 이름. 없으면 RDS `DBName` → `postgres` 순서. 이름을 정하지 않았는데 `postgres` 외 DB 가 있으면 앱 DB 를 확정하지 않고 gaps 에 남김 |
+  | `ALPHA_SOURCE_DB_NAME` | 조회할 앱 DB 이름. 우선순위: 이 변수 > ECS 태스크 정의의 `PGDATABASE` 힌트(`PGHOST` 가 원본 DB 호스트인 컨테이너의 평문 값, 하나로 정해질 때만) > RDS `DBName` > `postgres`. 힌트로 얻은 이름의 DB 가 없으면 `postgres` 로 대신하지 않고 비운 뒤 gaps 에 남김. 이름을 정하지 못해 폴백했는데 `postgres` 외 DB 가 있으면 앱 DB 를 확정하지 않고 gaps 에 남김 |
+  | `ALPHA_ALLOW_ENV_REFS=1` | **개발 전용.** `db_admin_ref` 의 `env://PREFIX`(PREFIX_USER/PREFIX_PASSWORD) 를 허용. 꺼져 있으면 거부(화면 입력으로 서버 환경변수를 읽지 못하게). 운영에선 `secret://` 사용 |
   | `ALPHA_DB_ADMIN_ASM_FALLBACK=1` | **개발 전용.** `db_admin_ref` 가 없을 때 Secrets Manager 의 RDS 시크릿에서 계정을 읽음. 이름표가 있으면 실패해도 폴백하지 않음 |
+- 앱 DB 이름 힌트용으로 `ecs:ListClusters`, `ecs:ListServices`, `ecs:DescribeServices`, `ecs:DescribeTaskDefinition` 읽기 권한도 씁니다 (`app_hint.py`, 보조. 실패하면 조용히 건너뜀).
 - `db_admin_ref` 의 값 형식은 db_migration(PR #31) 과 같은 `{"user": ..., "password": ...}` 입니다.
 
 ## app.py 가 읽는 것 (읽기 전용 권한)
@@ -108,7 +110,6 @@ provisioning 도 같은 키 이름표(`source.credentials_ref.cloud`)를 `resolv
 - [ ] 원본 AWS 키: 사용자가 미리 만든 IAM 사용자 키를 등록 (김준석 제안, 안재현 확인 대기)
 - [ ] `psycopg` 의존성: 합의 전이라 psql 폴백으로 동작. 합의되면 폴백 제거 (김준석)
 - [ ] bastion 프로비저닝: 지금은 이미 떠 있는 bastion 을 태그로 찾아 쓰기만 함. 없을 때 만들지 여부와 방식(terraform / boto3)은 미정 (김준석)
-- [ ] `aws.py` 의 키 필드명: 이 모듈은 `access_key_id`/`secret_access_key` 를 읽지만 db_migration(PR #31)은 `aws_access_key_id`/`aws_secret_access_key` 로 저장함. 한쪽으로 통일 필요 (공동)
 - [ ] `core/secrets.py` 의 `put_secret` / `resolve` — PR #29(안재현) 의 dict 반환에 맞춤. 머지 전엔 `secret://` 이름표는 gaps 로 끝남
 - [ ] PG 버전 기준: cdc 명세 "16 이상" vs 판정 "10~16" (안재현)
 - [ ] `db_tier` 매핑 규칙 확인 (박준서)

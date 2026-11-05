@@ -1,6 +1,6 @@
 """db_admin_ref(원본 RDS 마스터 계정 이름표) → PG 접속용 자격 증명.
 
-- `secret://…`(core/secrets) 와 `env://PREFIX`(PREFIX_USER/PREFIX_PASSWORD) 를 지원합니다. 환경변수는 읽기만 합니다.
+- `secret://…`(core/secrets) 와 `env://PREFIX`(PREFIX_USER/PREFIX_PASSWORD, 개발 전용: `ALPHA_ALLOW_ENV_REFS=1` 일 때만) 를 지원합니다. 환경변수는 읽기만 합니다.
 - 비밀번호는 반환 값(자격 증명 dict)에만 있고 사유 문장·예외·로그에는 절대 넣지 않습니다.
 """
 
@@ -12,6 +12,8 @@ import re
 from typing import Any
 
 from app.features.assessment.aws import error_code
+
+ALLOW_ENV_REFS_ENV = "ALPHA_ALLOW_ENV_REFS"  # 개발 전용: 화면 입력으로 서버 환경변수를 읽지 못하게 막는 게이트
 
 Creds = dict[str, str]
 Result = tuple[Creds | None, str | None]
@@ -47,6 +49,8 @@ def resolve_db_admin(ref: str | None) -> Result:
             return None, f"DB 관리자 이름표를 풀지 못함: {type(e).__name__}"
         return _from_mapping(data)
     if ref.startswith("env://"):
+        if os.environ.get(ALLOW_ENV_REFS_ENV) != "1":  # import 시점이 아니라 호출 시점에 읽음
+            return None, "env:// 이름표는 로컬 개발에서만 씁니다 (secret:// 로 넘겨 주세요)"
         prefix = ref[len("env://"):]
         if not _PREFIX.match(prefix):
             return None, "env:// 이름표의 PREFIX 형식이 올바르지 않음 (대문자·숫자·밑줄만 허용)"

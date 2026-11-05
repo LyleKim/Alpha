@@ -1,6 +1,6 @@
 """원본 DB·네트워크 조회 통합. (담당: 김준석)
 
-흐름: RDS·네트워크(rds) → bastion → DB 관리자 자격(refs) → SSM 터널 → PG 카탈로그(pg_connect/pg_tables).
+흐름: RDS·네트워크(rds) → 앱 PGDATABASE 힌트(app_hint, 보조) → bastion → DB 관리자 자격(refs) → SSM 터널 → PG 카탈로그(pg_connect/pg_tables).
 절대 예외를 던지지 않습니다. 조회 못한 값은 None 으로 두고 gaps 에 한국어 문장(비밀 없음)만 남깁니다.
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-from . import bastion, pg_connect, pg_tables, rds, refs
+from . import app_hint, bastion, pg_connect, pg_tables, rds, refs
 from .aws import AwsSession
 from .schemas import AssessmentInput, DbAssessment
 
@@ -26,8 +26,12 @@ def _pg_step(inp: AssessmentInput, session: AwsSession, r: rds.RdsResult, gaps: 
     if creds is None:
         gaps.append(reason or "DB 관리자 자격 증명을 찾지 못함")
         return
+    # 우선순위: ALPHA_SOURCE_DB_NAME > ECS PGDATABASE 힌트 > RDS DBName > postgres(폴백)
     explicit = os.environ.get("ALPHA_SOURCE_DB_NAME")
-    database = explicit or r.db_name or "postgres"
+    hint = None if explicit else app_hint.pg_database_hint(
+        session, inp.aws_region, r.source_db.host, inp.ecs_cluster, inp.ecs_service)
+    named = explicit or hint  # 지정된 이름(폴백 아님)
+    database = named or r.db_name or "postgres"
     try:
         with bastion.open_tunnel(session, inp.aws_region, info, remote_host=r.source_db.host,
                                  remote_port=r.source_db.port) as (host, port):
@@ -39,7 +43,10 @@ def _pg_step(inp: AssessmentInput, session: AwsSession, r: rds.RdsResult, gaps: 
     gaps += res.gaps
     # 이름을 명시하지 않았는데(폴백 postgres) 사용자 DB 가 따로 있으면 postgres 일치는 검증이 아님
     users = [d for d in catalog.get("databases", []) if d != "postgres"]
-    if not explicit and not r.db_name and users:
+    if hint and not res.database_name:  # 지정된 이름이라 postgres 로 대신하지 않고 비움
+        res.database_name, res.tables = None, None
+        gaps.append(f"앱이 쓰는 DB({hint})를 찾지 못함")
+    elif not named and not r.db_name and users:
         res.database_name, res.tables = None, None
         gaps.append(f"앱 DB 이름을 확정하지 못함 (후보: {', '.join(users)}) — ALPHA_SOURCE_DB_NAME 지정 필요")
     update: dict = {"database_name": res.database_name, "wal_level": res.wal_level}

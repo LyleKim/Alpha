@@ -6,13 +6,13 @@ from botocore.exceptions import ClientError
 
 from app.features.assessment.rds import collect_rds
 
-VPC, RTB, SG = "vpc-0fd90e0e4ce2219b4", "rtb-0c80b73d5960c4559", "sg-09b90150496c163ea"
-HOST = "db-alpha-target.cnci622w6i37.ap-northeast-2.rds.amazonaws.com"
+VPC, RTB, SG = "vpc-0example1", "rtb-0example1", "sg-0example1"
+HOST = "db-example.abcdefghijkl.ap-northeast-2.rds.amazonaws.com"
 
 
 def _inst(status="in-sync", groups=True):
     return {
-        "DBInstanceIdentifier": "db-alpha-target", "DbiResourceId": "db-ABC", "Engine": "postgres",
+        "DBInstanceIdentifier": "db-example", "DbiResourceId": "db-ABC", "Engine": "postgres",
         "EngineVersion": "16.15", "DBInstanceClass": "db.t3.micro", "AllocatedStorage": 20,
         "PubliclyAccessible": False, "Endpoint": {"Address": HOST, "Port": 5432},
         "VpcSecurityGroups": [{"VpcSecurityGroupId": SG}],
@@ -76,9 +76,9 @@ def test_zero_instances():
 def test_many_instances_and_explicit():
     two = [_inst(), {**_inst(), "DBInstanceIdentifier": "a-other"}]
     r = collect_rds(_session(instances=two), "r", None)
-    assert r.gaps == ["RDS 인스턴스가 여러 개 — rds_instance_id 지정 필요: a-other, db-alpha-target"]
+    assert r.gaps == ["RDS 인스턴스가 여러 개 — rds_instance_id 지정 필요: a-other, db-example"]
     assert r.source_db.host is None
-    assert collect_rds(_session(instances=two), "r", "db-alpha-target").gaps == []
+    assert collect_rds(_session(instances=two), "r", "db-example").gaps == []
 
 
 def test_route_table_main_fallback_and_explicit():
