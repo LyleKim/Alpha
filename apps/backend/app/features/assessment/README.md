@@ -34,7 +34,11 @@ python -m app.features.assessment.cli --profile <읽기 전용 프로필> --aws-
 | `schemas.py` | 공동 | 계약. 상대 쪽 모델을 바꿀 땐 상대 리뷰 |
 | `service.py` | 이주호 | `run()`: 세션 → db·app 조회 → 합침 → plan → `AssessmentOutput` |
 | `aws.py` | 공동 | 키 이름표로 AWS 세션 만들기 |
-| `db.py` | 김준석 | RDS·PG·네트워크 조회 → `DbAssessment` (**아직 미구현: "미구현" 을 gaps 로 반환**) |
+| `db.py` | 김준석 | `collect(inp, session) -> DbAssessment`. RDS·네트워크 → bastion 터널 → PG 카탈로그 순서로 조회. 예외를 던지지 않고 실패는 gaps 로 남김 |
+| `rds.py` | 김준석 | RDS·VPC·라우팅 테이블 조회 → `DbInfo`·`SourceDb`·`SourceNetwork` (`pending-reboot` 이면 논리 복제를 켜진 것으로 치지 않음) |
+| `bastion.py` | 김준석 | 태그 `Purpose=alpha-assessment-bastion` 인 bastion 을 찾고 SSM 포트포워딩 터널을 열고 닫음 (프로비저닝은 하지 않음) |
+| `refs.py` | 김준석 | `db_admin_ref`(`secret://` · `env://`) → `{user, password}`. 개발용 ASM 폴백은 환경변수로만 켬 |
+| `pg_connect.py` · `pg_tables.py` | 김준석 | PG 읽기 전용 접속(psycopg 가 있으면 사용, 없으면 psql) · 카탈로그 → `TableInfo`·`wal_level` |
 | `app.py` | 이주호 | ECS·ECR 조회 → `AppAssessment` |
 | `plan.py` · `rules.py` | 이주호 | 필수 조건 판정, 목적지 매핑, risks·summary |
 | `ai.py` | 이주호 | AI 보강 (기본 꺼짐, `ALPHA_AI_ENABLED=1` + `pip install -e ".[ai]"`). summary 3줄·설명용 risks 만. 판정·target_infra 는 안 바꿈, 실패하면 규칙 결과 |
@@ -55,6 +59,20 @@ python -m app.features.assessment.cli --profile <읽기 전용 프로필> --aws-
 | `source` | db_migration (안재현) | cdc 명세 2절 칸: `account_id`, `region`, `db.*`, `network.*`, `app.db_user`, `tables`("schema.table"), `credentials_ref.cloud/db_admin` |
 | `plan` | 승인 ① 화면 (박재현), `plan.target_infra` → provisioning (박준서) | `MigrationPlan`: `target_infra`, `checks`, `risks`, `summary`, `steps`, `approvable`, `blocking` |
 | `gaps` | 승인 ① 화면 | 조회 실패 항목 |
+
+## db.py 가 읽는 것 (읽기 전용 권한)
+`rds:DescribeDBInstances`, `rds:DescribeDBParameters`, `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, `ec2:DescribeRouteTables`,
+`ec2:DescribeInstances`, `ssm:DescribeInstanceInformation`, 터널을 여는 `ssm:StartSession`(대상 bastion 과 문서 `AWS-StartPortForwardingSessionToRemoteHost`)·`ssm:TerminateSession`
+
+- **DB 접속은 bastion 경유**: 원본 RDS 는 퍼블릭 액세스가 꺼져 있고 VPN 은 `run()` 에서 나중에 만들어지므로, 이미 떠 있는 bastion 을 **태그로 찾아** SSM 터널로 PG 에 접속합니다. 없거나 SSM 이 Online 이 아니면 PG 단계를 건너뛰고 gaps 에 남깁니다 (프로비저닝은 이 모듈이 하지 않음).
+- **PG 에는 읽기만**: `default_transaction_read_only=on` 으로 접속하고 SELECT/SHOW 만 실행합니다. 비밀번호는 argv 가 아니라 `PGPASSWORD` 환경변수로만 자식 프로세스에 전달합니다.
+- **실행 서버 조건**: `aws` CLI 와 `session-manager-plugin` 이 필요합니다. PG 접속은 `psycopg` 가 있으면 그것을, 없으면 `psql` 을 씁니다 (psycopg 는 팀 합의 전이라 의존성에 넣지 않음).
+- **환경변수 (모두 선택)**
+  | 이름 | 뜻 |
+  | --- | --- |
+  | `ALPHA_SOURCE_DB_NAME` | 조회할 앱 DB 이름. 없으면 RDS `DBName` → `postgres` 순서. 이름을 정하지 않았는데 `postgres` 외 DB 가 있으면 앱 DB 를 확정하지 않고 gaps 에 남김 |
+  | `ALPHA_DB_ADMIN_ASM_FALLBACK=1` | **개발 전용.** `db_admin_ref` 가 없을 때 Secrets Manager 의 RDS 시크릿에서 계정을 읽음. 이름표가 있으면 실패해도 폴백하지 않음 |
+- `db_admin_ref` 의 값 형식은 db_migration(PR #31) 과 같은 `{"user": ..., "password": ...}` 입니다.
 
 ## app.py 가 읽는 것 (읽기 전용 권한)
 `sts:GetCallerIdentity`, `ecs:ListClusters`, `ecs:ListServices`, `ecs:DescribeServices`, `ecs:DescribeTaskDefinition`,
@@ -88,6 +106,9 @@ provisioning 도 같은 키 이름표(`source.credentials_ref.cloud`)를 `resolv
 - [x] `target_infra` 필드 이름 ↔ Terraform 변수 1:1 (박준서, 11/3 합의, PR #26)
 - [x] db.py · app.py 반환은 Pydantic 모델 (`DbAssessment` / `AppAssessment`) (김준석, 11/4)
 - [ ] 원본 AWS 키: 사용자가 미리 만든 IAM 사용자 키를 등록 (김준석 제안, 안재현 확인 대기)
+- [ ] `psycopg` 의존성: 합의 전이라 psql 폴백으로 동작. 합의되면 폴백 제거 (김준석)
+- [ ] bastion 프로비저닝: 지금은 이미 떠 있는 bastion 을 태그로 찾아 쓰기만 함. 없을 때 만들지 여부와 방식(terraform / boto3)은 미정 (김준석)
+- [ ] `aws.py` 의 키 필드명: 이 모듈은 `access_key_id`/`secret_access_key` 를 읽지만 db_migration(PR #31)은 `aws_access_key_id`/`aws_secret_access_key` 로 저장함. 한쪽으로 통일 필요 (공동)
 - [ ] `core/secrets.py` 의 `put_secret` / `resolve` — PR #29(안재현) 의 dict 반환에 맞춤. 머지 전엔 `secret://` 이름표는 gaps 로 끝남
 - [ ] PG 버전 기준: cdc 명세 "16 이상" vs 판정 "10~16" (안재현)
 - [ ] `db_tier` 매핑 규칙 확인 (박준서)

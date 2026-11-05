@@ -19,7 +19,7 @@ def test_db_not_implemented_blocks_approval_but_app_part_flows():
             calls.append((state, progress))
 
     out = service.run(INP, Ctx(), session=session())
-    assert any("db.py" in g for g in out.gaps)
+    assert any("DB·네트워크 조회" in g for g in out.gaps)  # 가짜 세션엔 rds 응답이 없어 조회 실패 gap
     assert not out.plan.approvable  # DB 값이 없으니 unknown → 승인 불가 (가짜 통과 없음)
     checks = {c.id: c.result for c in out.plan.checks}
     assert checks["image_available"] == "pass"
