@@ -102,12 +102,8 @@ def collect(inp: AssessmentInput, session: AwsSession) -> AppAssessment:
         name, value = item.get("name"), item.get("value", "")
         if not name:
             continue
-        if looks_secret(name):
-            gaps.append(f"평문 환경 변수 {name} 가 비밀로 보여 값을 넘기지 않음 (Secrets Manager 로 옮겨야 함)")
-            continue
-        if has_secret_value(value):  # 값은 gaps 에도 남기지 않음
-            gaps.append(f"평문 환경 변수 {name} 의 값에 비밀(접속 정보·키)이 들어 있어 값을 넘기지 않음 "
-                        "(Secrets Manager 로 옮겨야 함)")
+        if looks_secret(name) or has_secret_value(value):
+            # 보안 정책에 따른 의도적 제외는 수집 실패(gaps)로 취급하지 않습니다.
             continue
         env_vars[name] = value
     secret_refs = {s["name"]: s.get("valueFrom", "") for s in container.get("secrets") or [] if s.get("name")}

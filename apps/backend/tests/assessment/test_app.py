@@ -1,3 +1,5 @@
+import pytest
+
 from app.features.assessment import app as app_part
 from app.features.assessment.schemas import AssessmentInput
 
@@ -30,7 +32,7 @@ def test_plain_env_that_looks_secret_is_dropped():
     res = app_part.collect(_inp(), session())
     assert "DB_PASSWORD" not in res.facts.env_vars
     assert res.facts.env_vars["LOG_LEVEL"] == "INFO"
-    assert any("DB_PASSWORD" in g for g in res.gaps)
+    assert not any("DB_PASSWORD" in g for g in res.gaps)
     assert "s3cr3t-plain" not in res.model_dump_json()
 
 
@@ -91,7 +93,7 @@ def test_value_with_credentials_is_dropped_even_with_plain_name():
     ]))
     assert "DATABASE_URL" not in res.facts.env_vars and "UPSTREAM" not in res.facts.env_vars
     assert res.facts.env_vars["PUBLIC_URL"] == "https://example.com/app"
-    assert any("DATABASE_URL" in g for g in res.gaps) and any("UPSTREAM" in g for g in res.gaps)
+    assert not any("DATABASE_URL" in g or "UPSTREAM" in g for g in res.gaps)
     dumped = res.model_dump_json()
     assert "pl41n-pw" not in dumped and "AKIAABCDEFGHIJKLMNOP" not in dumped
 
@@ -148,3 +150,34 @@ def test_two_running_versions_are_not_pinned():
 def test_no_running_task_falls_back_to_tag_lookup():
     res = app_part.collect(_inp(), session())
     assert res.facts.image_digest == DIGEST
+
+
+@pytest.mark.parametrize("name", [
+    "PGPASSWORD", "DB_PASSWORD", "DB_PASSWD", "CLIENT_SECRET", "ACCESS_TOKEN",
+    "SIGNING_KEY", "KEY", "PASSPHRASE",
+    "SSH_PRIVATE_KEY", "SERVICE_API_KEY", "AWS_ACCESS_KEY_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+])
+def test_sensitive_env_is_dropped_without_collection_gap(name):
+    value = "sensitive-value-sentinel"
+    c = container()
+    c["environment"].append({"name": name, "value": value})
+    res = app_part.collect(_inp(), session(c))
+
+    assert name not in res.facts.env_vars
+    assert value not in res.model_dump_json()
+    assert res.gaps == []
+    assert res.facts.env_vars["LOG_LEVEL"] == "INFO"
+    assert res.facts.secret_refs == {item["name"]: item["valueFrom"] for item in c["secrets"]}
+
+
+def test_intentional_exclusion_does_not_hide_collection_failure():
+    value = "sensitive-value-sentinel"
+    c = container()
+    c["environment"].append({"name": "API_KEY", "value": value})
+    res = app_part.collect(_inp(), session(c, ecr={"describe_images": FakeAwsError("AccessDeniedException")}))
+
+    assert "API_KEY" not in res.facts.env_vars
+    assert value not in res.model_dump_json()
+    assert not any("API_KEY" in gap or "DB_PASSWORD" in gap for gap in res.gaps)
+    assert any("AccessDeniedException" in gap for gap in res.gaps)
