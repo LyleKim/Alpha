@@ -16,8 +16,8 @@ class Err(Exception):
         self.error = N(code=code) if code else None
 
 
-def server(public="Enabled", subnet=None):
-    return N(version="16", sku=N(name="Standard_D2s_v3", tier="GeneralPurpose"), storage=N(storage_size_gb=128),
+def server(public="Enabled", subnet=None, location=None):
+    return N(location=location, version="16", sku=N(name="Standard_D2s_v3", tier="GeneralPurpose"), storage=N(storage_size_gb=128),
              network=N(public_network_access=public, delegated_subnet_resource_id=subnet),
              fully_qualified_domain_name="s.postgres.database.azure.com")
 
@@ -93,6 +93,12 @@ def test_ok():
     assert r.creds == {"user": "u", "password": "pw-secret"}
     with r.tunnel() as hp:
         assert hp == ("s.postgres.database.azure.com", 5432)
+
+
+def test_region_is_cdc_format():
+    # CDC(db_migration)의 Azure 리전 형식: 소문자·공백 없음. SDK 표시 이름도 같은 값이 되어야 한다.
+    for raw in ("Korea Central", "koreacentral"):
+        assert run(factory(server(location=raw))).region == "koreacentral"
 
 
 def test_ha_backup_cidrs():

@@ -262,7 +262,9 @@ def collect(inp: AssessmentInput, session: Any, client_factory: Callable[[Any, s
         except Exception as e:
             src.gaps.append(f"Private Endpoint 조회 실패 ({_err(e)})")
         subnet = pe["subnet_id"] if pe else None
-    src.region, src.account_id = getattr(s, "location", None), sub
+    loc = getattr(s, "location", None)
+    # SDK 는 "Korea Central" 처럼 표시 이름을 줄 수 있다. CDC 의 리전 형식은 "koreacentral"(소문자·공백 없음).
+    src.region, src.account_id = (loc.replace(" ", "").lower() if isinstance(loc, str) else None), sub
     sku, storage = getattr(s, "sku", None), getattr(s, "storage", None)
     host = getattr(s, "fully_qualified_domain_name", None)
     ha_mode = getattr(getattr(s, "high_availability", None), "mode", None)
