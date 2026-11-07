@@ -17,7 +17,7 @@ SENTINEL = "PW-SENTINEL-9f3a"
 INP = AssessmentInput(aws_credentials_ref="profile:x", aws_region="ap-northeast-2", target_region="asia-northeast3")
 CATALOG = {
     "databases": ["appdb", "postgres"], "current_database": "appdb", "wal_level": "logical",
-    "tables": [{"schema": "public", "name": "t", "qualified": "public.t", "row_estimate": 3, "has_primary_key": True}],
+    "tables": [{"schema": "public", "name": "t", "qualified": "public.t", "row_estimate": 3, "has_primary_key": True, "partitioned": False, "can_select": True}],
     "gaps": [],
 }
 

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,18 +23,23 @@ SQL_CURRENT_DB = "SELECT current_database()"
 SQL_WAL_LEVEL = "SHOW wal_level"
 SQL_MAX_SLOTS = "SHOW max_replication_slots"
 SQL_SLOTS_IN_USE = "SELECT count(*) FROM pg_replication_slots"
+# CDC 에이전트 카탈로그(infra/db_migration/agent/cdc_agent/catalog.py)와 같은 대상·기준: alpha_cdc(마커)와
+# 확장 소유 테이블은 뺀다. 파티션·SELECT 권한은 CDC 가 거절하므로 함께 읽어 gap 으로 알린다.
 # PK 컬럼은 indkey 순서대로 정렬. reltuples는 통계 기반 추정치(미분석 테이블은 -1).
 SQL_TABLES = """
 SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner), c.relreplident, c.reltuples,
        (SELECT array_agg(a.attname ORDER BY array_position(i.indkey::int2[], a.attnum))
           FROM pg_index i
           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-         WHERE i.indrelid = c.oid AND i.indisprimary) AS pk_columns
+         WHERE i.indrelid = c.oid AND i.indisprimary) AS pk_columns,
+       c.relkind, c.relispartition,
+       has_schema_privilege(n.oid, 'USAGE') AND has_table_privilege(c.oid, 'SELECT')
   FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE c.relkind IN ('r', 'p')
-   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-   AND n.nspname NOT LIKE 'pg_toast%'
+   AND n.nspname !~ '^pg_' AND n.nspname NOT IN ('information_schema', 'alpha_cdc')
+   AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
  ORDER BY n.nspname, c.relname
 """
 # 복제 권한을 주는 역할. AWS 는 rds_superuser 가 rds_replication 의 멤버라 마스터 계정이 상속으로 얻으므로
@@ -120,13 +126,14 @@ def collect_pg_catalog(cur: Any, cloud: str = "aws") -> dict:
 
     def tables():
         res = []
-        for schema, name, owner, ident, tuples, pk in rows(SQL_TABLES):
+        for schema, name, owner, ident, tuples, pk, kind, is_part, can_select in rows(SQL_TABLES):
             cols = _pk_cols(pk)
             res.append({
                 "schema": schema, "name": name, "qualified": f"{schema}.{name}",
                 "has_primary_key": bool(cols), "primary_key_columns": cols,
                 "replica_identity": _REPLIDENT.get(ident, str(ident)),
                 "row_estimate": _row_estimate(tuples), "owner": owner,
+                "partitioned": kind == "p" or _bool(is_part) is True, "can_select": _bool(can_select),
             })
         return res
 
@@ -147,6 +154,22 @@ def tables_without_pk(catalog: dict) -> list[str]:
         if gap not in catalog["gaps"]:
             catalog["gaps"].append(gap)
     return names
+
+
+_CDC_TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$")  # job_request.py 와 같은 규칙
+
+
+def cdc_refusals(tables: list[dict]) -> list[str]:
+    """CDC(db_migration)가 작업 등록 때 거절하는 테이블. 승인 전에 미리 알린다. PK 없음은 rules.py 가 판정."""
+    checks = (("파티션 테이블은 CDC 가 지원하지 않음", lambda t: t["partitioned"]),
+              ("원본 계정이 SELECT 할 수 없음", lambda t: t["can_select"] is False),
+              ("테이블 이름이 소문자 규칙이 아님", lambda t: not _CDC_TABLE_NAME.fullmatch(t["qualified"])))
+    out = []
+    for why, bad in checks:
+        names = [t["qualified"] for t in tables if bad(t)]
+        if names:
+            out.append(f"{why}: {', '.join(names[:5])}" + (f" 외 {len(names) - 5}개" if len(names) > 5 else ""))
+    return out
 
 
 @dataclass
@@ -180,6 +203,7 @@ def catalog_to_dbinfo(catalog: dict, requested_database: str | None) -> CatalogR
         res.max_replication_slots = catalog.get("max_replication_slots")
         res.replication_slots_in_use = catalog.get("slots_in_use")
     if "tables" not in failed:
+        res.gaps += cdc_refusals(catalog["tables"])
         res.tables = [TableInfo(schema_name=t["schema"], name=t["name"], row_count=t["row_estimate"],
                                 has_primary_key=t["has_primary_key"]) for t in catalog["tables"]]
     return res
