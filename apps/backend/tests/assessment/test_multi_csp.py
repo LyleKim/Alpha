@@ -7,6 +7,10 @@ from app.features.assessment.csp import logical_enabled
 from app.features.assessment.schemas import AssessmentInput
 
 KW = dict(aws_credentials_ref="profile:x", aws_region="ap-northeast-2", target_region="asia-northeast3")
+# gcp·azure 는 cloud_source 가 필수(#94 검증). 중계 수집기는 읽지 않는다
+CS = {"gcp": dict(region="asia-northeast3", app_name="a", db_instance="pg1", project_id="p"),
+      "azure": dict(region="koreacentral", app_name="a", db_instance="s", subscription_id="sub",
+                    resource_group="rg", credentials_ref="secret://x"), "aws": None}
 
 
 def test_source_kind_default_aws():
@@ -16,7 +20,7 @@ def test_source_kind_default_aws():
 @pytest.mark.parametrize("cloud", ["aws", "gcp", "azure"])
 def test_csp_without_collector_falls_to_gaps(cloud, monkeypatch):
     monkeypatch.delitem(db.COLLECTORS, cloud)
-    out = db.collect(AssessmentInput(source_kind=cloud, db_instance_id="x", **KW), object())
+    out = db.collect(AssessmentInput(source_kind=cloud, db_instance_id="x", cloud_source=CS[cloud], **KW), object())
     assert out.gaps and out.facts.engine is None and out.source_db.instance_id is None
 
 
@@ -42,7 +46,7 @@ def test_three_csps_same_shape_no_secret(monkeypatch):
     monkeypatch.setattr(pg_connect, "collect_catalog", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("pw-secret")))
     keys = None
     for cloud, rid in [("aws", "i"), ("gcp", "pg1"), ("azure", "rg/srv")]:
-        out = db.collect(AssessmentInput(source_kind=cloud, db_instance_id=rid, db_admin_ref="env://X", **KW), object())
+        out = db.collect(AssessmentInput(source_kind=cloud, db_instance_id=rid, cloud_source=CS[cloud], db_admin_ref="env://X", **KW), object())
         d = out.model_dump()
         assert set(d) == {"facts", "source_db", "network", "region", "account_id", "gaps"}
         keys = keys or {k: set(v) for k, v in d.items() if k not in ("gaps", "region", "account_id")}
@@ -73,10 +77,10 @@ def test_logical_flag_per_csp():
 
 
 def test_gcp_azure_need_neither_aws_nor_manual():
-    for k in ("gcp", "azure"):  # AWS·manual 값은 필요 없고, 원본 위치는 cloud_source 또는 db_instance_id 로 준다
-        assert AssessmentInput(source_kind=k, db_instance_id="x", target_region="t").source_kind == k
+    for k in ("gcp", "azure"):  # AWS·manual 값은 필요 없고 cloud_source 가 필수(#94). db_instance_id 만으로는 통과하지 않는다
+        assert AssessmentInput(source_kind=k, cloud_source=CS[k], target_region="t").source_kind == k
         with pytest.raises(ValueError):
-            AssessmentInput(source_kind=k, target_region="t")
+            AssessmentInput(source_kind=k, db_instance_id="x", target_region="t")
     with pytest.raises(ValueError):
         AssessmentInput(source_kind="manual", target_region="t")
 

@@ -7,7 +7,10 @@ import pytest
 from app.features.assessment import azure_pg, db
 from app.features.assessment.schemas import AssessmentInput
 
-KW = dict(aws_credentials_ref="x", aws_region="r", target_region="t", source_kind="azure")
+# 검증용 cloud_source(#94 입력). 중계 수집기는 읽지 않고 db_instance_id 등을 쓴다
+KW = dict(aws_credentials_ref="x", aws_region="r", target_region="t", source_kind="azure",
+          cloud_source=dict(region="koreacentral", app_name="a", db_instance="s", subscription_id="sub",
+                            resource_group="rg", credentials_ref="secret://x"))
 
 
 class Err(Exception):

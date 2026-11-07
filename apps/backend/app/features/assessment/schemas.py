@@ -278,7 +278,7 @@ class AssessmentInput(BaseModel):
     - "aws"(기본): AWS 계정을 조회합니다. aws_credentials_ref · aws_region 이 필요합니다.
     - "manual": 사람이 입력한 manual 값으로 만듭니다. 원본에서 확인한 값이 아니라 gaps 에 남깁니다.
     - "gcp" / "azure": cloud_source 위치의 앱·DB 를 클라우드 API 로 조회합니다 (cloud_source.py).
-      db_instance_id 를 주면 관리형 PostgreSQL 을 중계 VM 으로 읽는 경로(db.py: gcp_sql · azure_pg)를 쓸 수 있습니다.
+      db_instance_id·gcp_project·azure_subscription_id 는 중계 VM 으로 읽는 경로(db.py: gcp_sql · azure_pg)의 입력입니다. 아직 service 가 부르지 않습니다.
     """
 
     run_id: str | None = None
@@ -308,12 +308,10 @@ class AssessmentInput(BaseModel):
         elif self.source_kind == "manual":
             if self.manual is None:
                 raise ValueError("source_kind=manual 에는 manual 이 필요합니다")
-        elif self.cloud_source is None:
-            # db_instance_id 로 DB 만 읽는 경로(db.py)는 cloud_source 없이도 입력으로 받는다
-            if not (self.db_instance_id or self.rds_instance_id):
-                raise ValueError(f"source_kind={self.source_kind} 에는 cloud_source 가 필요합니다")
         else:
             src = self.cloud_source
+            if src is None:
+                raise ValueError(f"source_kind={self.source_kind} 에는 cloud_source 가 필요합니다")
             need = ("project_id",) if self.source_kind == "gcp" else ("subscription_id", "resource_group",
                                                                      "credentials_ref")
             missing = [n for n in need if not getattr(src, n)]
