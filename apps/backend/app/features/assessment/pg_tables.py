@@ -39,6 +39,7 @@ SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner), c.relreplident, c.relt
 # 복제 권한을 주는 역할. AWS 는 rds_superuser 가 rds_replication 의 멤버라 마스터 계정이 상속으로 얻으므로
 # 직접 멤버가 아니라 pg_has_role(USAGE) 로 상속까지 본다(실 RDS PG16 에서 확인). GCP/Azure 는 관리자 역할
 # (cloudsqlsuperuser, azure_pg_admin)이 REPLICATION 속성을 주지 않음이 Azure 실환경에서 확인돼 속성만 본다.
+# 미검증: GCP 는 실환경 권한이 없어 이 판정을 검증하지 못함(Azure 결과를 준용). Cloud SQL 에서 cloudsqlsuperuser 가 REPLICATION 을 주는지 확인 필요.
 REPLICATION_ROLES = {"aws": ("rds_replication",), "gcp": (), "azure": ()}
 
 
