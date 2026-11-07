@@ -1,6 +1,6 @@
 # OCI IPSec 연결 1개 = 상대 쪽 터널 1개.
 # 구간마다 이 모듈을 2번 불러 터널 2개(서로 다른 양쪽 IP)를 만든다.
-# OCI IPSec 연결은 터널을 늘 2개 만들지만 여기서는 첫 번째 터널만 BGP로 쓴다.
+# OCI IPSec 연결은 터널을 늘 2개 만들지만 여기서는 tunnel_index가 고른 터널만 BGP로 쓴다.
 
 terraform {
   required_providers {
@@ -51,6 +51,18 @@ variable "shared_secret" {
   sensitive = true
 }
 
+variable "phase_two_dh_group" {
+  description = "Phase 2 PFS 그룹. null이면 OCI 기본값을 쓴다"
+  type        = string
+  default     = null
+}
+
+variable "tunnel_index" {
+  description = "쓸 OCI 공인 IP의 순번(0 또는 1). 같은 구간의 두 연결은 서로 다른 값을 줘야 양쪽 IP가 갈린다"
+  type        = number
+  default     = 0
+}
+
 resource "oci_core_cpe" "this" {
   compartment_id = var.compartment_id
   display_name   = var.name
@@ -72,7 +84,9 @@ data "oci_core_ipsec_connection_tunnels" "this" {
 }
 
 locals {
-  tunnel = data.oci_core_ipsec_connection_tunnels.this.ip_sec_connection_tunnels[0]
+  # 연결마다 터널 순서가 달라 목록 위치로는 IP가 겹칠 수 있다. 공인 IP 순서로 고른다.
+  tunnels_by_ip = { for t in data.oci_core_ipsec_connection_tunnels.this.ip_sec_connection_tunnels : t.vpn_ip => t }
+  tunnel        = local.tunnels_by_ip[sort(keys(local.tunnels_by_ip))[var.tunnel_index]]
 }
 
 resource "oci_core_ipsec_connection_tunnel_management" "primary" {
@@ -87,6 +101,14 @@ resource "oci_core_ipsec_connection_tunnel_management" "primary" {
     customer_bgp_asn      = var.peer_asn
     customer_interface_ip = var.peer_bgp_ip
     oracle_interface_ip   = var.oracle_bgp_ip
+  }
+
+  dynamic "phase_two_details" {
+    for_each = var.phase_two_dh_group == null ? [] : [var.phase_two_dh_group]
+    content {
+      is_pfs_enabled = true
+      dh_group       = phase_two_details.value
+    }
   }
 }
 
