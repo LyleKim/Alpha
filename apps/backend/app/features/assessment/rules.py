@@ -281,10 +281,27 @@ def collect_risks(inv: InventoryForPlanning, checks: list[PlanCheck]) -> list[Ri
     return risks
 
 
-def build_steps() -> list[PlanStep]:
+def image_registry_label(uri: str | None) -> str:
+    """이미지 이동 단계에 보일 원본 저장소 이름. AWS ECR 주소면 "ECR", 아니면 주소의 호스트.
+
+    첫 경로 조각에 `.`·`:` 이 있거나 `localhost` 일 때만 호스트로 봅니다 (docker 와 같은 규칙).
+    `library/nginx`, `bitnami/postgresql` 처럼 계정 이름만 있으면 Docker Hub 입니다.
+    """
+    if not uri:
+        return "원본 저장소(미제공)"
+    first, sep, _ = uri.partition("/")
+    if not sep or not ("." in first or ":" in first or first == "localhost"):
+        return "Docker Hub"
+    if ".dkr.ecr." in first:
+        return "ECR"
+    return first
+
+
+def build_steps(image_uri: str | None = None) -> list[PlanStep]:
     return [
         PlanStep(order=1, module="workflows", action="계획 승인 ①", needs_approval=True),
-        PlanStep(order=2, module="provisioning", action="이미지 이동 ECR → Artifact Registry"),
+        PlanStep(order=2, module="provisioning",
+                 action=f"이미지 이동 {image_registry_label(image_uri)} → Artifact Registry"),
         PlanStep(order=3, module="provisioning",
                  action="terraform apply: VPC, Cloud SQL(논리 디코딩), Artifact Registry, Cloud Run, Secret Manager"),
         PlanStep(order=4, module="provisioning", action="Cloud Run 상태 확인 경로 성공 확인 → TargetEnv 반환"),
