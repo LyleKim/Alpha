@@ -806,7 +806,8 @@ def resolve_inputs(mig: DbMigrationInput) -> Resolved:
     if not mig.options.skip_vpn:
         # VPN이 직접 읽는 값이다. 구축을 시작한 뒤가 아니라 여기서 실패한다.
         resolve(mig.source.credentials_ref.cloud)
-        resolve(mig.target.credentials_ref.cloud)
+        if not mig.options.pass_onprem:
+            resolve(mig.target.credentials_ref.cloud)
     target = mig.target.credentials_ref
     settings = tunables()
     return Resolved(
