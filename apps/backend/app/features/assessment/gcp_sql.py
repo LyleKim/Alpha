@@ -35,6 +35,12 @@ def _net(url: str | None) -> str:
     return (url or "").partition("projects/")[2]
 
 
+def _backup_days(st: dict) -> int | None:
+    """retainedBackups 는 기본 단위가 보관 '개수'(retentionUnit=COUNT)라 일 수가 아니다. 일 단위일 때만 채운다."""
+    r = (st.get("backupConfiguration") or {}).get("backupRetentionSettings") or {}
+    return r.get("retainedBackups") if str(r.get("retentionUnit", "")).upper() in ("DAYS", "DAY") else None
+
+
 def _psa_cidr(compute: Any, project: str, vpc: str | None, host: str | None) -> str | None:
     """서버 사설 IP 가 속한 사설 서비스 접속(VPC_PEERING) 예약 대역. 못 찾으면 None."""
     import ipaddress
@@ -185,7 +191,7 @@ def collect(
         engine="postgres" if ver.startswith("POSTGRES") else None, publicly_accessible=public, engine_version=version,
         instance_class=st.get("tier"), vcpu=vcpu, memory_gib=mem, allocated_storage_gb=disk_gb, logical_replication=lr,
         ha_enabled=None if "availabilityType" not in st else st["availabilityType"] == "REGIONAL",
-        backup_retention_days=((st.get("backupConfiguration") or {}).get("backupRetentionSettings") or {}).get("retainedBackups"))
+        backup_retention_days=_backup_days(st))
     src.source_db = SourceDb(
         instance_id=d.get("name"), host=host, port=5432 if host else None, version=version,
         publicly_accessible=public, logical_replication=lr)

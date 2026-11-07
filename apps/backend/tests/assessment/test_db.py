@@ -203,3 +203,18 @@ def test_slots_filled_for_non_aws(fx, monkeypatch, cloud):
     fx["catalog"] = {**CATALOG, "max_replication_slots": 10, "slots_in_use": 2}
     out = db.collect(INP.model_copy(update={"source_kind": cloud}), object())
     assert (out.facts.max_replication_slots, out.facts.replication_slots_in_use) == (10, 2)
+
+
+@pytest.mark.parametrize("cloud,text", [("aws", "DB 관리자 계정에 복제 권한이 없음"), ("gcp", "REPLICATION 속성이 없음"),
+                                        ("azure", "REPLICATION 속성이 없음")])
+def test_no_replication_gap_wording_per_csp(fx, monkeypatch, cloud, text):
+    from app.features.assessment import csp
+    r = fx["rds"]
+    monkeypatch.setitem(db.COLLECTORS, cloud, lambda inp, sess: csp.CspSource(
+        db=r.db, source_db=r.source_db, network=r.network, creds={"user": "u", "password": SENTINEL},
+        tunnel=lambda: contextlib.nullcontext(("h", 5432))))
+    fx["catalog"] = {**CATALOG, "can_replicate": False}
+    gaps = db.collect(INP.model_copy(update={"source_kind": cloud}), object()).gaps
+    assert any(text in g for g in gaps)
+    if cloud != "aws":  # 수집이 빠진 것이 아니라 확인 사항이다
+        assert not any("복제 권한이 없음" in g for g in gaps) and any("ALTER ROLE" in g for g in gaps)

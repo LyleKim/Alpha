@@ -99,7 +99,8 @@ def test_timeout(popen):
     assert made[0].waited
 
 
-def test_bad_host():
+@pytest.mark.parametrize("host", ["h; rm", "-oProxyCommand=x", "-h"])
+def test_bad_host(host):  # 첫 글자가 '-' 면 ssh 옵션으로 읽힐 수 있어 거부
     with pytest.raises(st.SshTunnelError):
-        with st.forward("h; rm", "d", 1):
+        with st.forward(host, "d", 1):
             pass

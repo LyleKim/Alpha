@@ -75,7 +75,10 @@ def _pg_step(inp: AssessmentInput, src: CspSource, gaps: list[str]) -> None:
     res = pg_tables.catalog_to_dbinfo(catalog, database)
     gaps += res.gaps
     if catalog.get("can_replicate") is False:
-        gaps.append("DB 관리자 계정에 복제 권한이 없음")
+        if inp.source_kind == "aws":
+            gaps.append("DB 관리자 계정에 복제 권한이 없음")
+        else:  # GCP·Azure 관리자 역할은 원래 REPLICATION 속성이 없다. CDC 는 전용 계정에 속성을 주므로 막힘이 아니라 확인 사항
+            gaps.append("조회 계정에 REPLICATION 속성이 없음 — CDC 전용 계정에 ALTER ROLE … WITH REPLICATION 을 줄 수 있는지 확인 필요")
     # 이름을 명시하지 않았는데(폴백 postgres) 사용자 DB 가 따로 있으면 postgres 일치는 검증이 아님
     users = [d for d in catalog.get("databases", []) if d != "postgres"]
     if hint and not res.database_name:  # 지정된 이름이라 postgres 로 대신하지 않고 비움

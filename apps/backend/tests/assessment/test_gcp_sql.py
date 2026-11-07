@@ -110,12 +110,21 @@ def test_ok():
 
 def test_ha_backup_cidrs():
     d = inst("on")
-    d["settings"].update(availabilityType="REGIONAL", backupConfiguration={"backupRetentionSettings": {"retainedBackups": 14}})
+    d["settings"].update(availabilityType="REGIONAL", backupConfiguration={"backupRetentionSettings": {"retainedBackups": 14, "retentionUnit": "DAYS"}})
     d["settings"]["ipConfiguration"]["authorizedNetworks"] = [{"value": "1.2.3.0/24"}, {"name": "x"}]
     s = run(fake(d))
     assert s.db.ha_enabled is True and s.db.backup_retention_days == 14 and s.network.allowed_cidrs == ["1.2.3.0/24"]
     d["settings"]["availabilityType"] = "ZONAL"
     assert run(fake(d)).db.ha_enabled is False
+
+
+def test_backup_retention_unit_count_is_not_days():
+    # retainedBackups 는 보관 개수(retentionUnit=COUNT)라 일 수로 쓰지 않는다
+    d = inst("on")
+    for unit, want in (("COUNT", None), (None, None), ("DAYS", 7)):
+        r = {"retainedBackups": 7, **({"retentionUnit": unit} if unit else {})}
+        d["settings"]["backupConfiguration"] = {"backupRetentionSettings": r}
+        assert run(fake(d)).db.backup_retention_days == want, unit
 
 
 @pytest.mark.parametrize("flag,want", [("off", False), (None, False), ("on", True)])
