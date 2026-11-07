@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
-from .image_transfer import TransferResult, load_aws_credentials, parse_ecr_host, parse_image, transfer_image
+from .image_transfer import DESTINATION_LOGINS, TransferResult, load_aws_credentials, parse_ecr_host, parse_image, transfer_image
 from .providers import DEFAULT_PROVIDER, GCP, get_provider, terraform_dir
 from .schemas import AppDeployInput, AppDeployOutput, ProvisioningInput, ProvisioningOutput
 from .target import TargetBuildError, build_target, find_problems
@@ -82,11 +82,16 @@ def _converge(
     tf: TerraformCli,
     *,
     deploy_app: bool,
-    # init 이 끝난 뒤, 계획을 세우기 전에 부른다. 돌려준 값을 변수에 더한다 (앱 배포의 이미지 복사에 쓴다).
     prepare: Callable[[TerraformCli], Mapping[str, Any]] | None = None,
 ) -> tuple[str, dict[str, int], bool, dict[str, Any]]:
     project_id = resolve_project_id(inp.project_id, inp.provider)
-    values = build_tfvars(inp.target_infra, project_id=project_id, deploy_app=deploy_app, provider=inp.provider)
+    target_infra = inp.target_infra
+    adapt = get_provider(inp.provider).adapt
+    if adapt is not None: 
+        target_infra, notes = adapt(target_infra)
+        for note in notes:
+            ctx.report("running", 4, message=note)
+    values = build_tfvars(target_infra, project_id=project_id, deploy_app=deploy_app, provider=inp.provider)
 
     # 임시 폴더에 변수 파일과 계획 파일을 두고, 끝나면 폴더째 자동으로 지워진다 (with 블록을 나가는 순간)
     with tempfile.TemporaryDirectory(prefix="alpha-tf-") as tmp:
@@ -102,7 +107,7 @@ def _converge(
 
         ctx.report("running", 15, message="변경 계획 확인")
         exit_code = tf.plan(var_file, plan_file)  # 0 = 바뀔 것 없음, 2 = 바뀔 것 있음
-        if exit_code == 0:  # 바뀔 것이 없다 (이미 원하는 상태)
+        if exit_code == 0:  
             counts, deletions = {"add": 0, "change": 0, "destroy": 0}, []
         else:
             counts, deletions = summarize_plan(tf.show_plan(plan_file))
@@ -125,6 +130,7 @@ def _converge(
     return project_id, counts, applied, outputs
 
 
+
 def run(
     inp: ProvisioningInput,
     ctx: Reporter,
@@ -132,8 +138,7 @@ def run(
     terraform: TerraformCli | None = None,
     put_secret: PutSecret | None = None,
 ) -> ProvisioningOutput:
-    # provisioning 단계: 목적지 인프라를 만들고 target 을 돌려준다.
-    # 목적지 비밀(관리자 계정, VPN 자격 증명)은 비밀 저장소에 넣고 결과에는 이름표만 남긴다.
+
     tf = terraform or default_terraform(inp.provider)
     project_id, counts, applied, outputs = _converge(inp, ctx, tf, deploy_app=False)
 
@@ -197,6 +202,7 @@ def _output_value(outputs: Mapping[str, Any], name: str) -> Any:
     return entry.get("value") if isinstance(entry, Mapping) else None
 
 
+
 def _image_step(
     inp: AppDeployInput, ctx: Reporter, transfer: Callable[..., TransferResult]
 ) -> Callable[[TerraformCli], dict[str, Any]] | None:
@@ -212,6 +218,9 @@ def _image_step(
     if inp.dry_run:
         ctx.report("running", 2, message="dry_run 이라 이미지 복사를 건너뜁니다")
         return None
+    if inp.provider not in DESTINATION_LOGINS:
+        ctx.report("running", 2, message=f"목적지 '{inp.provider}' 는 이미지 복사 로그인이 없어 복사를 건너뜁니다 (목적지 저장소에 이미지가 이미 있어야 합니다)")
+        return None
     needs_aws_key = parse_ecr_host(parse_image(str(source_image)).registry) is not None
     if needs_aws_key and not inp.source_credentials_ref:
         ctx.report("running", 2, message="원본 AWS 키가 없어 이미지 복사를 건너뜁니다 (목적지 저장소에 이미지가 이미 있어야 합니다)")
@@ -225,7 +234,8 @@ def _image_step(
         raise ProvisioningError("service_name 이 없어 복사할 이미지의 목적지 이름을 정할 수 없습니다")
 
     def prepare(tf: TerraformCli) -> dict[str, Any]:
-        registry_url = _output_value(tf.output_json(), "registry_url")
+        outputs = tf.output_json()
+        registry_url = _output_value(outputs, "registry_url")
         if not registry_url:
             raise ProvisioningError("registry_url 출력이 없습니다. provisioning 단계가 먼저 끝나 있어야 합니다")
         credentials = load_aws_credentials(inp.source_credentials_ref) if needs_aws_key else None
@@ -239,9 +249,24 @@ def _image_step(
         )
         done = "목적지에 있던 이미지를 사용" if getattr(result, "reused", False) else "이미지 복사 완료"
         ctx.report("running", 12, message=f"{done} ({result.digest[:19]})")
+        # DR 을 켠 경우 DR 앱은 자기 저장소에서 받으므로 같은 이미지를 DR 저장소에도 복사한다 (digest 는 같다).
+        dr_registry_url = _output_value(outputs, "dr_registry_url")
+        if dr_registry_url:
+            dr_result = transfer(
+                source_image=str(source_image),
+                service_name=str(service_name),
+                registry_url=str(dr_registry_url),
+                provider=inp.provider,
+                aws_credentials=credentials,
+                report=lambda message: ctx.report("running", 13, message=f"DR: {message}"),
+            )
+            if dr_result.digest != result.digest:
+                raise ProvisioningError("DR 저장소에 복사한 이미지의 digest 가 주 저장소와 다릅니다")
+            ctx.report("running", 14, message=f"DR 저장소에도 복사 완료 ({dr_result.digest[:19]})")
         return {"container_image": result.container_image}
 
     return prepare
+
 
 
 def deploy_app(
@@ -255,8 +280,7 @@ def deploy_app(
     worker: WorkerClient | None = None,
     transfer: Callable[..., TransferResult] = transfer_image,
 ) -> AppDeployOutput:
-    # app_deploy 단계: 목적지 앱(Cloud Run)을 배포하고 app_url 을 돌려줌.
-    # 앱이 준비되면 Worker 가 그 주소로 보내도록 알림 (update_worker_target).
+  
     worker_client = None
     if inp.update_worker_target and not inp.dry_run:
         worker_client = worker or WorkerClient.from_env()
@@ -281,7 +305,6 @@ def deploy_app(
     if not app_url:
         raise ProvisioningError("app_url 출력이 없습니다. 앱이 배포되지 않았습니다")
 
-    # /health/ready 는 DB 연결까지 본다. 컷오버 전에 DB 에 붙는지 알아야 해서, TF startup probe(health_check_path, /health/live)와 일부러 다르다.
     _wait_healthy(
         app_url.rstrip("/") + "/health/ready",
         ctx,
