@@ -493,6 +493,9 @@ def _check_cdc_settings() -> None:
         AgentSettings.from_env()
     except KeyError:
         raise RuntimeError("CDC_AGENT_URL 환경변수가 설정되지 않아 CDC 를 시작할 수 없습니다") from None
+    if adapter_for(run.request).provider == "onprem":
+        inp["options"] = {"pass_onprem": True}
+
     _require_real_agent()
     if _use_existing_vpn():
         return  # VPN 을 미리 띄웠으면 OCI 로 VPN 을 만들지 않으므로 OCI 설정이 필요 없습니다.
@@ -682,7 +685,7 @@ def run_db_migration(
     _require_real_agent()
     if _use_existing_vpn():
         # 팀이 미리 띄운 VPN 으로 원본·대상이 이미 닿을 때. probe 가 실패하면 바로 멈춥니다.
-        inp["options"] = {"skip_vpn": True}
+        inp.setdefault("options", {})["skip_vpn"] = True
 
     job_id = to_job_id(run.run_id)
     ready_event = threading.Event()
