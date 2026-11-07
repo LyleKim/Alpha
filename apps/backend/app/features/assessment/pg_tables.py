@@ -36,16 +36,18 @@ SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner), c.relreplident, c.relt
    AND n.nspname NOT LIKE 'pg_toast%'
  ORDER BY n.nspname, c.relname
 """
-# 복제 권한을 주는 역할(직접 멤버만 확인). GCP/Azure 는 관리자 역할(cloudsqlsuperuser, azure_pg_admin)이
-# REPLICATION 속성을 주지 않음이 Azure 실환경에서 확인돼 속성(rolreplication/rolsuper)만 본다.
+# 복제 권한을 주는 역할. AWS 는 rds_superuser 가 rds_replication 의 멤버라 마스터 계정이 상속으로 얻으므로
+# 직접 멤버가 아니라 pg_has_role(USAGE) 로 상속까지 본다(실 RDS PG16 에서 확인). GCP/Azure 는 관리자 역할
+# (cloudsqlsuperuser, azure_pg_admin)이 REPLICATION 속성을 주지 않음이 Azure 실환경에서 확인돼 속성만 본다.
 REPLICATION_ROLES = {"aws": ("rds_replication",), "gcp": (), "azure": ()}
 
 
 def sql_can_replicate(cloud: str = "aws") -> str:
     roles = ", ".join(f"'{r}'" for r in REPLICATION_ROLES[cloud])  # 고정 상수라 주입 위험 없음
+    # 역할이 없으면 pg_roles 에서 0행이라 pg_has_role 이 호출되지 않아 오류가 나지 않음
     member = f""" OR EXISTS (
-         SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
-          WHERE m.member = r.oid AND g.rolname IN ({roles}))""" if roles else ""
+         SELECT 1 FROM pg_roles g
+          WHERE g.rolname IN ({roles}) AND pg_has_role(r.oid, g.oid, 'USAGE'))""" if roles else ""
     return f"""
 SELECT r.rolreplication OR r.rolsuper{member}
   FROM pg_roles r WHERE r.rolname = current_user

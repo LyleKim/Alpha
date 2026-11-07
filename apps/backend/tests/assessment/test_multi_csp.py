@@ -56,12 +56,13 @@ def test_unknown_csp_gap_not_raise():
 
 
 def test_replication_role_per_csp():
-    assert "'rds_replication'" in pg_tables.sql_can_replicate("aws")
+    aws = pg_tables.sql_can_replicate("aws")  # 상속 멤버십까지(pg_has_role), 직접 멤버(pg_auth_members) 아님
+    assert "'rds_replication'" in aws and "pg_has_role" in aws and "pg_auth_members" not in aws
     for cloud in ("aws", "gcp", "azure"):
         assert "rds_superuser" not in pg_tables.sql_can_replicate(cloud)
     for cloud in ("gcp", "azure"):  # 관리자 역할은 REPLICATION 을 주지 않으므로 속성만 본다
         sql = pg_tables.sql_can_replicate(cloud)
-        assert "pg_auth_members" not in sql and "rolreplication" in sql
+        assert "pg_has_role" not in sql and "pg_auth_members" not in sql and "rolreplication" in sql
 
 
 def test_logical_flag_per_csp():
