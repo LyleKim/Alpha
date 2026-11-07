@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 from .settings import tunables
 
@@ -109,9 +109,10 @@ class TargetDb(BaseModel):
 
 
 class TargetNetwork(BaseModel):
-    vpc_name: str
-    subnet_cidrs: list[str] = Field(min_length=1)
-    psa_range_cidr: str
+    # Required unless options.pass_onprem; see require_gcp_fields.
+    vpc_name: str | None = None
+    subnet_cidrs: list[str] | None = Field(default=None, min_length=1)
+    psa_range_cidr: str | None = None
 
 
 class TargetApp(BaseModel):
@@ -129,10 +130,10 @@ class TargetCredentials(BaseModel):
 
 class TargetInput(BaseModel):
     cloud: str = "gcp"
-    project_id: str
+    project_id: str | None = None  # required unless options.pass_onprem
     region: str
     db: TargetDb
-    network: TargetNetwork
+    network: TargetNetwork = Field(default_factory=TargetNetwork)
     app: TargetApp
     credentials_ref: TargetCredentials
 
@@ -141,6 +142,19 @@ class MigrationOptions(BaseModel):
     log_interval_s: float = Field(default_factory=_log_interval_s)
     max_hold_ms: int = Field(default_factory=_max_hold_ms)
     skip_vpn: bool = Field(default=False, description="For local tests: source and target are already reachable")
+    pass_onprem: bool = Field(default=False, description="목적지가 온프렘(Cloudflare 터널)이라 OCI<->GCP 구간을 만들지 않고 AWS<->OCI만 연결")
+
+
+def require_gcp_fields(target: TargetInput, options: "MigrationOptions") -> None:
+    """The GCP fields stay mandatory unless the GCP leg is skipped."""
+    if options.pass_onprem:
+        return
+    n = target.network
+    missing = [name for name, v in (("project_id", target.project_id), ("network.vpc_name", n.vpc_name),
+                                    ("network.subnet_cidrs", n.subnet_cidrs),
+                                    ("network.psa_range_cidr", n.psa_range_cidr)) if not v]
+    if missing:
+        raise ValueError(f"target.{', target.'.join(missing)} required unless options.pass_onprem")
 
 
 class DbMigrationInput(BaseModel):
@@ -148,6 +162,11 @@ class DbMigrationInput(BaseModel):
     source: SourceInput
     target: TargetInput
     options: MigrationOptions = Field(default_factory=MigrationOptions)
+
+    @model_validator(mode="after")
+    def _gcp_fields(self) -> "DbMigrationInput":
+        require_gcp_fields(self.target, self.options)
+        return self
 
 
 class StartInput(BaseModel):
@@ -163,6 +182,11 @@ class StartInput(BaseModel):
     run_id: str | None = Field(default=None, pattern=RUN_ID_PATTERN)
     source: SourceInput | None = Field(default=None, description="Left out: found with the lookup the caller passes")
     options: MigrationOptions = Field(default_factory=MigrationOptions)
+
+    @model_validator(mode="after")
+    def _gcp_fields(self) -> "StartInput":
+        require_gcp_fields(self.target, self.options)
+        return self
 
     @field_validator("db_user", "db_password")
     @classmethod
