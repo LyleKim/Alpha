@@ -59,12 +59,20 @@ def vm(id_, net="vpc", nat=None, ip="10.1.0.2", status="RUNNING", label="alpha-a
                                    "networkIP": ip, "accessConfigs": ac}]}
 
 
-def fake_compute(*vms, exc=None):
+PSA = [{"network": "https://x/projects/p1/global/networks/vpc", "address": "10.0.0.0", "prefixLength": 24}]
+
+
+def fake_compute(*vms, exc=None, psa=PSA):
     class Req:
         def execute(self):
             if exc:
                 raise exc
             return {"items": {"zones/z": {"instances": list(vms)}}}
+
+    class Addr:
+        def list(self, **kw):
+            assert kw["filter"] == 'purpose="VPC_PEERING"'
+            return type("R", (), {"execute": lambda s: {"items": psa}})()
 
     class Inst:
         def aggregatedList(self, **kw):
@@ -74,6 +82,9 @@ def fake_compute(*vms, exc=None):
     class C:
         def instances(self):
             return Inst()
+
+        def globalAddresses(self):
+            return Addr()
 
     return lambda session: C()
 
@@ -88,6 +99,7 @@ def test_ok():
     s = run(fake(inst("on")))
     assert (s.db.engine, s.db.engine_version, s.db.instance_class, s.db.allocated_storage_gb) == ("postgres", "15", "db-custom-2-7680", 100)
     assert s.db.logical_replication is True and s.db.publicly_accessible is False
+    assert s.network.cidr == "10.0.0.0/24"
     assert (s.source_db.instance_id, s.source_db.host, s.source_db.port) == ("pg1", "10.0.0.5", 5432)
     assert s.network.vpc_id.endswith("/vpc")
     assert s.creds == {"user": "u", "password": "pw-secret"} and len(s.gaps) == 1 and "중계 VM" in s.gaps[0]
@@ -264,3 +276,9 @@ def test_tier_size(tier, want):
     d["settings"]["tier"] = tier
     s = run(fake(d))
     assert (s.db.vcpu, s.db.memory_gib) == want
+
+
+def test_psa_cidr_missing_or_error_is_not_fatal():
+    assert run(fake(inst()), compute=fake_compute(psa=[])).network.cidr is None
+    s = run(fake(inst()), compute=fake_compute(psa=[{"network": "https://x/projects/p1/global/networks/other", "address": "10.0.0.0", "prefixLength": 24}]))
+    assert s.network.cidr is None and not any("접속 대역" in g for g in s.gaps)

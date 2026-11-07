@@ -35,6 +35,22 @@ def _net(url: str | None) -> str:
     return (url or "").partition("projects/")[2]
 
 
+def _psa_cidr(compute: Any, project: str, vpc: str | None, host: str | None) -> str | None:
+    """서버 사설 IP 가 속한 사설 서비스 접속(VPC_PEERING) 예약 대역. 못 찾으면 None."""
+    import ipaddress
+
+    if not (vpc and host):
+        return None
+    ip = ipaddress.ip_address(host)
+    r = compute.globalAddresses().list(project=project, filter='purpose="VPC_PEERING"').execute()
+    for a in r.get("items") or []:
+        if _net(a.get("network")) == _net(vpc) and a.get("address") and a.get("prefixLength") is not None:
+            net = ipaddress.ip_network(f"{a['address']}/{a['prefixLength']}", strict=False)
+            if ip in net:
+                return str(net)
+    return None
+
+
 def find_bastion(compute: Any, project: str, vpc: str | None) -> dict | None:
     """라벨 purpose=alpha-assessment-bastion 인 RUNNING VM 중 같은 VPC 의 것만. VPC 미상이면 BASTION_NAME_ENV 로 고정된 VM 만."""
     pin = os.environ.get(BASTION_NAME_ENV)
@@ -176,6 +192,10 @@ def collect(
     src.network = SourceNetwork(
         vpc_id=ip.get("privateNetwork"), allowed_cidrs=[n["value"] for n in ip.get("authorizedNetworks") or [] if n.get("value")])
     src.region, src.account_id = d.get("region"), project
+    try:
+        src.network.cidr = _psa_cidr(compute_factory(session), project, ip.get("privateNetwork"), addrs.get("PRIVATE"))
+    except Exception as e:
+        src.gaps.append(f"사설 서비스 접속 대역 조회 실패 ({_err(e)})")
     conn = d.get("connectionName")
 
     src.creds, reason = refs.resolve_db_admin(inp.db_admin_ref)
