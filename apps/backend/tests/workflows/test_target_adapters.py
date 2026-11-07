@@ -121,7 +121,7 @@ def test_extra_params_accept_references_and_plain_settings():
 # -- 어댑터 선택 ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("provider", ["azure", "ncp"])
+@pytest.mark.parametrize("provider", ["ncp"])  # azure 는 어댑터가 등록되어 거절 대상이 아니다
 def test_create_run_refuses_a_target_without_an_adapter(client, provider):
     response = client.post("/runs", json={**SIMPLE_BODY, "target_infra": {"provider": provider}})
 
@@ -131,7 +131,7 @@ def test_create_run_refuses_a_target_without_an_adapter(client, provider):
 
 
 def test_unknown_provider_is_rejected_by_the_schema(client):
-    assert client.post("/runs", json={**SIMPLE_BODY, "target_infra": {"provider": "aws"}}).status_code == 422
+    assert client.post("/runs", json={**SIMPLE_BODY, "target_infra": {"provider": "oracle"}}).status_code == 422
 
 
 def test_adapter_defaults_to_gcp_for_requests_without_target_infra():
@@ -143,9 +143,9 @@ def test_provisioning_refuses_instead_of_building_another_cloud(tmp_path, monkey
         raise AssertionError("GCP 를 대신 구축하면 안 됩니다")
 
     monkeypatch.setattr(provisioning_service, "run", must_not_run)
-    run = _run_at_provisioning(tmp_path, MigrationRequest(**SIMPLE_BODY, target_infra={"provider": "azure"}))
+    run = _run_at_provisioning(tmp_path, MigrationRequest(**SIMPLE_BODY, target_infra={"provider": "ncp"}))
 
-    with pytest.raises(UnsupportedTarget, match="azure"):
+    with pytest.raises(UnsupportedTarget, match="ncp"):
         runners.run_provisioning(run, RecordingContext())
 
 
@@ -261,3 +261,7 @@ def test_target_infra_extra_params_rejects_nested_raw_secrets():
         extra_params={"azure": {"client_secret": "secret://azure/cred"}, "items": [{"token": "secret://tok"}]},
     )
     assert cfg.extra_params["azure"]["client_secret"] == "secret://azure/cred"
+
+
+def test_aws_is_a_known_provider_with_an_adapter(client):
+    assert client.post("/runs", json={**SIMPLE_BODY, "target_infra": {"provider": "aws"}}).status_code == 201

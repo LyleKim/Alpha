@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from functools import lru_cache
 
@@ -12,6 +13,7 @@ from app.features.db_migration.guide_workflow import to_job_id
 
 from .engine import Engine, InvalidTransition
 from .healer import SelfHealingDiagnosis, diagnose_run
+from .reasoning_bank import default_bank
 from .preflight import evaluate_cutover
 from .readiness import cutover_readiness
 from .schemas import (
@@ -25,11 +27,14 @@ from .schemas import (
     StageName,
     WorkflowState,
 )
-from .runners import RUNNERS, clean_up_cdc
+from .runners import RUNNERS, clean_up_cdc, decommission_cdc
 from .store import RunNotFound, RunStore
+from .timings import RunTimings, TimingBaseline, run_timings, timing_baseline
 from .target_adapters import UnsupportedTarget, adapter_for
+from app.core.local_access import require_local_access
 
 router = APIRouter(prefix="/runs", tags=["workflows"])
+logger = logging.getLogger(__name__)
 
 PreflightEvaluator = Callable[[RunStatus], PreflightReport]
 
@@ -37,7 +42,21 @@ PreflightEvaluator = Callable[[RunStatus], PreflightReport]
 @lru_cache
 def get_engine() -> Engine:
     # 연결된 모듈은 runners.RUNNERS 에 단계별로 등록합니다. 없는 단계는 수동 입력 대기입니다.
-    return Engine(RunStore(get_settings().workflows_db_path), RUNNERS, abort_cleanup=clean_up_cdc)
+    return Engine(
+        RunStore(get_settings().workflows_db_path),
+        RUNNERS,
+        abort_cleanup=clean_up_cdc,
+        decommission=decommission_cdc,
+        memory=_memory_or_none(),
+    )
+
+
+def _memory_or_none():
+    try:
+        return default_bank()
+    except Exception:  # 기억 저장소를 못 열어도 workflows 는 그대로 돕니다
+        logger.warning("ReasoningBank 를 열지 못해 학습 없이 시작합니다", exc_info=True)
+        return None
 
 
 def get_preflight() -> PreflightEvaluator:
@@ -80,6 +99,23 @@ def list_runs(
     limit: int = Query(50, ge=1, le=200), engine: Engine = Depends(get_engine)
 ) -> list[RunStatus]:
     return engine.list(limit)
+
+
+@router.get("/stats/timings", response_model=TimingBaseline)
+def get_timing_baseline(
+    limit: int = Query(200, ge=1, le=200), engine: Engine = Depends(get_engine)
+) -> TimingBaseline:
+    """지난 실행들의 단계별 소요 시간 분포(최소·중앙값·최대, 표본 수). 예상이 아니라 과거 실측입니다."""
+    return timing_baseline(engine.list(limit))
+
+
+@router.get("/{run_id}/timings", response_model=RunTimings)
+def get_run_timings(run_id: str, engine: Engine = Depends(get_engine)) -> RunTimings:
+    """이 run 의 단계별 실제 소요 시간. 재지 못한 단계는 값 없이 이유(note)만 돌려줍니다."""
+    try:
+        return run_timings(engine.get(run_id))
+    except RunNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"run {run_id} 이(가) 없습니다") from None
 
 
 @router.get("/{run_id}", response_model=RunDetail)
@@ -133,6 +169,23 @@ def retry_cleanup(run_id: str, background: BackgroundTasks, engine: Engine = Dep
     return run
 
 
+@router.post("/{run_id}/decommission", response_model=RunDetail, dependencies=[Depends(require_local_access)])
+def decommission_run(
+    run_id: str,
+    background: BackgroundTasks,
+    operator: str | None = Query(None, description="철거 승인자 식별자"),
+    engine: Engine = Depends(get_engine),
+) -> RunDetail:
+    """전환이 끝난 run 의 이전 자원(CDC 복제 작업·복제 슬롯·VPN)을 정리합니다. 실패하면 다시 부를 수 있습니다.
+
+    VPN 삭제가 몇 분 걸려 백그라운드에서 돌립니다. 진행과 결과는 cleanup_state · cleanup_message 에 남습니다.
+    비가역 조치이므로 로컬 권한(require_local_access)과 데이터 검증(match) 상태를 확인합니다.
+    """
+    run = _apply(run_id, lambda: engine.start_decommission(run_id, operator=operator))
+    background.add_task(engine.run_decommission, run_id)
+    return run
+
+
 @router.post("/{run_id}/resume", response_model=RunDetail)
 def resume_run(run_id: str, background: BackgroundTasks, engine: Engine = Depends(get_engine)) -> RunDetail:
     run = _apply(run_id, lambda: engine.resume(run_id))
@@ -167,10 +220,19 @@ def get_preflight_report(
 
 
 @router.get("/{run_id}/diagnosis", response_model=SelfHealingDiagnosis)
-@router.post("/{run_id}/diagnose", response_model=SelfHealingDiagnosis)
 def get_diagnosis(run_id: str, engine: Engine = Depends(get_engine)) -> SelfHealingDiagnosis:
-    """장애 발생 시 AI 자가치유(Self-Healing) 진단 리포트를 생성합니다."""
+    """장애 발생 시 자가치유(Self-Healing) 진단 리포트를 돌려줍니다. 과거에 풀린 같은 장애면 기억으로 답합니다."""
+    return _diagnose(run_id, engine, use_memory=True)
+
+
+@router.post("/{run_id}/diagnose", response_model=SelfHealingDiagnosis)
+def rediagnose(run_id: str, engine: Engine = Depends(get_engine)) -> SelfHealingDiagnosis:
+    """기억을 건너뛰고 새로 진단합니다 (AI 재진단)."""
+    return _diagnose(run_id, engine, use_memory=False)
+
+
+def _diagnose(run_id: str, engine: Engine, *, use_memory: bool) -> SelfHealingDiagnosis:
     run = _apply(run_id, lambda: engine.get(run_id))
     if run.state != WorkflowState.FAILED:
         raise HTTPException(status.HTTP_409_CONFLICT, f"실패한 run 만 진단합니다 (현재 {run.state.value})")
-    return diagnose_run(run)
+    return diagnose_run(run, use_memory=use_memory)

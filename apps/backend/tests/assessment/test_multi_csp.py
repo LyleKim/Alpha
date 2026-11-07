@@ -16,7 +16,7 @@ def test_source_kind_default_aws():
 @pytest.mark.parametrize("cloud", ["aws", "gcp", "azure"])
 def test_csp_without_collector_falls_to_gaps(cloud, monkeypatch):
     monkeypatch.delitem(db.COLLECTORS, cloud)
-    out = db.collect(AssessmentInput(source_kind=cloud, **KW), object())
+    out = db.collect(AssessmentInput(source_kind=cloud, db_instance_id="x", **KW), object())
     assert out.gaps and out.facts.engine is None and out.source_db.instance_id is None
 
 
@@ -73,8 +73,10 @@ def test_logical_flag_per_csp():
 
 
 def test_gcp_azure_need_neither_aws_nor_manual():
-    for k in ("gcp", "azure"):
-        assert AssessmentInput(source_kind=k, target_region="t").source_kind == k
+    for k in ("gcp", "azure"):  # AWS·manual 값은 필요 없고, 원본 위치는 cloud_source 또는 db_instance_id 로 준다
+        assert AssessmentInput(source_kind=k, db_instance_id="x", target_region="t").source_kind == k
+        with pytest.raises(ValueError):
+            AssessmentInput(source_kind=k, target_region="t")
     with pytest.raises(ValueError):
         AssessmentInput(source_kind="manual", target_region="t")
 

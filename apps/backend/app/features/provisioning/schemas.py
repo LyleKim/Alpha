@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 # 입력으로 받을 수 있는 목적지 이름. 등록된 이름(providers.PROVIDERS)과 같아야 하고, 같은지는 tests/provisioning/test_providers.py 가 확인한다.
 # 이 파일이 구현(providers, terraform)을 import 하지 않게 이름만 여기에 둔다.
-ProviderName = Literal["gcp"]
+ProviderName = Literal["gcp", "azure", "aws"]
 DEFAULT_PROVIDER: ProviderName = "gcp"
 
 
@@ -62,3 +62,6 @@ class AppDeployOutput(BaseModel):
     changes: dict[str, int]
     applied: bool
     worker_target_updated: bool = False  # Worker 의 원본 주소를 app_url 로 바꿨는지
+    # 배포 직후 직접 호출을 실제로 쳐 본 결과. SECURE=헤더 없이 403·헤더 있으면 통과, EXPOSED=헤더 없이 통과,
+    # MISCONFIGURED=헤더가 있어도 403(Worker 도 막힘). 판단할 수 없으면 None
+    ingress_guard: str | None = None

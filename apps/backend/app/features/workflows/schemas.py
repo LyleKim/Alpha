@@ -20,7 +20,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.features.assessment.schemas import ManualSource
+from app.features.assessment.schemas import CloudSource, ManualSource
 
 # ---------------------------------------------------------------------------
 # 상태·단계
@@ -55,7 +55,7 @@ PreflightStatus = Literal["pass", "fail", "unknown", "info"]
 PreflightVerdict = Literal["go", "no_go", "unverified"]
 CheckStatus = Literal["pass", "fail", "unknown"]
 CutoverDecision = Literal["go", "needs_confirmation", "no_go"]
-TargetInfraType = Literal["gcp", "azure", "ncp"]
+TargetInfraType = Literal["gcp", "azure", "aws", "ncp"]
 
 _SECRET_LIKE_PARAM = re.compile(r"password|passwd|secret|token|api_?key|private_?key|credential", re.IGNORECASE)
 
@@ -117,8 +117,10 @@ class MigrationRequest(BaseModel):
     github_repo_url: str | None = None  # 선택. 이미지는 provisioning 이 원본 ECR 에서 복사합니다 (PR #40)
     service_name: str | None = None  # 원본 서비스 이름. ecs_service 를 비우면 이 값을 씁니다
     # 원본을 읽는 방법. "aws"(기본)는 AWS 계정을 조회하고, "manual" 은 사람이 넣은 manual 값을 씁니다 (assessment #56).
-    source_kind: Literal["aws", "manual"] = "aws"
+    # "gcp"·"azure" 는 cloud_source 위치의 앱·DB 를 클라우드 API 로 조회합니다 (assessment cloud_source.py).
+    source_kind: Literal["aws", "manual", "gcp", "azure"] = "aws"
     manual: ManualSource | None = None  # source_kind="manual" 이면 필수. 비밀 원문은 넣지 않습니다
+    cloud_source: CloudSource | None = None  # source_kind="gcp"·"azure" 면 필수. 비밀은 이름표만
     aws_region: str | None = None  # source_kind="aws" 면 필수
     aws_role_ref: str | None = None  # 원본 조회용 IAM 역할 ARN
     aws_credentials_ref: str | None = None  # 원본 AWS 자격증명 참조 (secret://... 등)
@@ -152,6 +154,8 @@ class MigrationRequest(BaseModel):
             raise ValueError("source_kind=aws 에는 aws_region 이 필요합니다")
         if self.source_kind == "manual" and self.manual is None:
             raise ValueError("source_kind=manual 에는 manual 이 필요합니다")
+        if self.source_kind in ("gcp", "azure") and self.cloud_source is None:
+            raise ValueError(f"source_kind={self.source_kind} 에는 cloud_source 가 필요합니다")
         return self
 
     @model_validator(mode="after")
@@ -181,6 +185,11 @@ class ApproveRequest(BaseModel):
 
 class AbortRequest(BaseModel):
     reason: str | None = None
+
+
+class DecommissionRequest(BaseModel):
+    operator: str | None = Field(default=None, description="철거 승인 운영자 서명")
+    reason: str | None = Field(default=None, description="철거 확인 사유")
 
 
 class ManualStageInput(BaseModel):

@@ -86,7 +86,8 @@ class FakeClouds:
             ips = (swapped and self.aws_ips_after_swap) or ["7.0.0.1", "7.0.0.2"]
             self.state[root] = {"tunnels": [{"aws_ip": ip} for ip in ips]}
         else:
-            self.state[root] = {"oracle_tunnel_ips": OCI_IPS, "tunnel_status": {k: self.status for k in OCI_IPS}}
+            ips = {k: OCI_IPS[k] for k in tfvars["tunnels"]}
+            self.state[root] = {"oracle_tunnel_ips": ips, "tunnel_status": {k: self.status for k in ips}}
 
 
 @pytest.fixture(autouse=True)
@@ -109,9 +110,9 @@ def make_tf(clouds: FakeClouds) -> vpn.Terraform:
                          {"credentials_json": "{}"}, runner=clouds)
 
 
-def ensure(clouds: FakeClouds) -> dict:
-    return vpn.ensure_vpn(DbMigrationInput.model_validate(INPUT), JOB_ID, terraform=make_tf(clouds),
-                          sleep=lambda s: None)
+def ensure(clouds: FakeClouds, options: dict | None = None, input: dict = INPUT) -> dict:
+    return vpn.ensure_vpn(DbMigrationInput.model_validate({**input, "options": options or {}}), JOB_ID,
+                          terraform=make_tf(clouds), sleep=lambda s: None)
 
 
 def test_order_follows_the_ip_dependencies():
@@ -350,3 +351,70 @@ def test_environment_values_have_no_default(monkeypatch, name):
     monkeypatch.delenv(name)
     with pytest.raises(MissingSetting, match=name):
         vpn.OciSettings.from_env()
+
+
+# --- pass_onprem: only the AWS-OCI leg ---
+
+GCP_FREE = {**INPUT, "target": {**INPUT["target"], "network": {}}}
+GCP_FREE["target"].pop("project_id")
+
+
+def test_pass_onprem_applies_only_aws_and_oci():
+    clouds = FakeClouds()
+    result = ensure(clouds, {"pass_onprem": True}, GCP_FREE)
+
+    assert [r for r, _ in clouds.applies] == ["aws-vpn", "oci-vpn", "aws-vpn"]
+    assert set(clouds.applies[1][1]["tunnels"]) == {"aws-0", "aws-1"}
+    assert set(clouds.applies[1][1]["shared_secrets"]) == {"aws-0", "aws-1"}
+    assert set(result["tunnel_status"]) == {"aws-0", "aws-1"}
+    assert "gcp" not in clouds.envs
+
+
+def test_pass_onprem_does_not_resolve_gcp_credentials(monkeypatch):
+    # Only the source cloud secret exists, so a target-cloud resolve would raise KeyError.
+    put_secret(f"secret://{RUN_ID}/source-cloud", {"aws_access_key_id": AWS_KEY, "aws_secret_access_key": "s"})
+    clouds, real = FakeClouds(), vpn.Terraform
+    monkeypatch.setattr(vpn, "Terraform", lambda *a: real(*a, runner=clouds))
+    mig = DbMigrationInput.model_validate({**GCP_FREE, "options": {"pass_onprem": True}})
+
+    assert vpn.ensure_vpn(mig, JOB_ID, sleep=lambda s: None)["skipped"] is False
+    assert "gcp" not in clouds.envs
+    assert vpn.VpnContext.load(RUN_ID).target == {}
+
+
+def test_tunnels_up_without_gcp_keys():
+    keys = vpn.active_keys(True)
+    assert keys == ("aws-0", "aws-1")
+    assert vpn._tunnels_up({"aws-0": "UP", "aws-1": "UP"}, keys)
+    assert not vpn._tunnels_up({"aws-0": "UP", "aws-1": "UP"})
+
+
+def test_pass_onprem_rerun_reuses_and_destroy_skips_gcp():
+    clouds = FakeClouds()
+    ensure(clouds, {"pass_onprem": True}, GCP_FREE)
+    clouds.applies.clear()
+    assert ensure(clouds, {"pass_onprem": True}, GCP_FREE)["skipped"] is True
+    assert clouds.applies == []
+    assert vpn.destroy_vpn(RUN_ID, terraform=make_tf(clouds)) is True
+    assert clouds.destroyed == ["aws-vpn", "oci-vpn"]
+
+
+def test_pass_onprem_waits_for_aws_tunnels(monkeypatch):
+    monkeypatch.setenv("CDC_TUNNEL_WAIT_S", "-1")
+    with pytest.raises(RuntimeError, match="not up"):
+        ensure(FakeClouds(status="DOWN"), {"pass_onprem": True}, GCP_FREE)
+
+
+def test_default_still_five_steps_and_all_keys():
+    clouds = FakeClouds()
+    ensure(clouds)
+    assert [r for r, _ in clouds.applies] == ["gcp", "aws-vpn", "oci-vpn", "aws-vpn", "gcp"]
+    assert set(clouds.applies[2][1]["tunnels"]) == set(vpn.TUNNEL_KEYS)
+
+
+def test_skip_vpn_alone_still_requires_gcp_fields_and_is_kept():
+    assert DbMigrationInput.model_validate({**INPUT, "options": {"skip_vpn": True}}).options.skip_vpn
+    with pytest.raises(ValueError, match="pass_onprem"):
+        DbMigrationInput.model_validate({**GCP_FREE, "options": {"skip_vpn": True}})
+    with pytest.raises(ValueError, match="pass_onprem"):
+        DbMigrationInput.model_validate(GCP_FREE)

@@ -1,15 +1,16 @@
 """DB 이전 모듈의 입구이자 전체 절차. 호출하는 쪽은 이 파일의 다섯 함수만 알면 된다.
 
-    run(입력)                 run_id를 바로 돌려주고, 아래를 백그라운드로 진행한다.
+    run(입력)                 입력을 검사·주입하고 run_id를 바로 돌려준다. 나머지는 백그라운드에서 진행한다.
       1. 입력 검사, 비밀값 저장     입력 비밀값은 이 시점 이후 이름표로만 다룬다.
-      2. 에이전트 확인             Kafka, Connect, 플러그인
-      3. 원본 확인                source를 받았으면 그대로, 없으면 넘겨받은 조회 함수로
-      4. 시작 전 검사              계정 일치, 공인 접근, 대역 겹침, 동시 실행 (preflight.py)
-      5. VPN 확인                 있으면 재사용, 없으면 구축 (vpn.py)
-      6. 접속 확인, 비밀 전달, 작업 등록
-      7. 초기 복제 → 실시간 복제    에이전트가 진행하고, cutover_ready에서 호출을 기다린다.
+      2. DB·네트워크 조회, 실행 모델 변환 (cloud_lookup.py, execution_model.py)
+      3. 시작 전 검사              공인 접근, 대역 겹침, 클러스터 상태, 동시 실행 (start_checks.py)
+      4. VPN 확인                 있으면 재사용, 없으면 구축 (vpn_workflow.py)
+      5. 접속 확인                 CDC 노드에서 양쪽 DB의 host·port (connect_check.py)
+      6. DB·테이블 조회, 작업 요청 구성 (catalog.py, job_request.py)
+      7. 비밀 전달, 작업 등록
+      8. 초기 복제 → 실시간 복제    에이전트가 진행하고, cutover_ready에서 호출을 기다린다.
     status(run_id)            단계, 진행률, 지표, 정리가 남은 항목
-    cutover(run_id, 승인자)    전환 후 결과 반환: 성공 / 원본 복귀 / 수동 확인 / 시간 초과
+    cutover(run_id, 승인자)    전환 후 결과 반환: 전환 완료 / 원본 복귀 / 전환 후 실패 / 확인 불가
     finish(run_id)            전환 후 정리: 복제 자원 → VPN → 비밀값
     stop(run_id)              전환 전 중단: 복제 자원 → VPN → 비밀값
 
@@ -38,46 +39,85 @@ from typing import Any, Protocol
 import httpx
 from pydantic import ValidationError
 
-from app.core.secrets import delete_secret, has_secret, put_secret, resolve
+from app.core.secrets import delete_secret, has_secret, resolve
 
-from . import preflight, redact, vpn
+from . import cloud_lookup, preflight, redact, vpn, vpn_workflow
+from .catalog import (
+    CatalogError,
+    CatalogOptions,
+    CatalogSelection,
+    DatabaseSelectionRequired,
+    discover_catalog,
+)
 from .client import AgentError, AgentSettings, CdcAgentClient
+from .cloud_guides import credential_next_steps
+from .connect_check import ConnectivityError, endpoints_of, wait_reachable
+from .execution_model import ExecutionModel, ExecutionModelError, build_execution_model
 from .input_secrets import INPUT_SECRETS
+from .job_request import (
+    JobRequestError,
+    build_request,
+    ensure_account,
+    ensure_account_refs,
+)
 from .progress_log import ProgressLog
+from .progress_view import (
+    CLOSED_PHASE,
+    CUTOVER_PHASE,
+    READY_PHASE,
+    STABILIZING_PHASE,
+    SWITCHED_PHASES,
+    clamp_progress,
+    classify_cutover,
+    network_exposure,
+    step_of_phase,
+    still_on_source,
+    to_metrics,
+)
+from .run_input import (
+    InjectedRun,
+    InvalidInput,
+    NoSavedInput,
+    forget_runs,
+    inject,
+    known_runs,
+    parse,
+    reload_run,
+    save_target_network,
+    saved_clouds,
+    saved_route,
+    saved_target_network,
+)
 from .schemas import (
+    CutoverOutcome,
     CutoverResult,
+    DatabaseChoices,
     DbMigrationInput,
     DbMigrationResult,
     FinishResult,
     JobOptions,
     JobRequest,
-    MigrationOptions,
+    RetryRequest,
+    Route,
+    RunError,
     RunStatus,
-    SourceInput,
-    SourceLookup,
+    RunSummary,
     SourceSpec,
-    StartInput,
-    TargetInput,
     TargetSpec,
 )
 from .settings import MissingSetting, tunables
+from .start_checks import CdcNetwork, StartCheckError, StartCheckInput, check_start
+from .vpn_plan import VpnError, VpnPlan
 
 logger = logging.getLogger(__name__)
 
-READY_PHASE = "cutover_ready"
-CUTOVER_PHASE = "cutover"
-STABILIZING_PHASE = "stabilizing"
-CLOSED_PHASE = "closed"
 METRIC_PHASES = {"streaming", READY_PHASE}
 # 복사가 빨리 끝나면 streaming 없이 READY_PHASE로 간다.
 APP_DEPLOY_PHASES = {"streaming", READY_PHASE}
 TERMINAL_STATES = {"succeeded", "failed", "aborted"}
 ENDED_STATES = {"succeeded", "aborted"}
-SWITCHED_PHASES = {STABILIZING_PHASE, CLOSED_PHASE}
 # 이 상태에서는 정리할 것이 남았는지가 호출자에게 필요하다.
 CLEANUP_STATES = {"failed", "stopped", "aborted", "succeeded", "unknown"}
-# 마커 테이블은 에이전트가 관리한다. 복제 대상에 넣지 않는다.
-INTERNAL_SCHEMA_PREFIX = "alpha_cdc."
 
 # 이 모듈이 만든다. assessment·provisioning의 입력은 플랫폼 소유다.
 OWN_SECRETS = ("source-repl", "vpn-psk", "vpn-context")
@@ -92,16 +132,23 @@ BUSY_MESSAGE = "run {run_id} is already running or being cleaned up"
 # 이 run 밖에 저장된 입력의 이름표. 값은 담지 않는다.
 OTHER_REFS = "other-refs"
 
-Discover = Callable[[SourceLookup], Any]
-
-
-class InvalidInput(ValueError):
-    """필드 이름만 담는다. pydantic 원문은 입력값을 인용할 수 있다."""
-
-    def __init__(self, fields: list[str]):
-        super().__init__(f"invalid input: {', '.join(fields)}")
-        self.fields = fields
-
+# 메시지에 입력값·응답 원문·비밀값을 담지 않는 오류다. 이것 말고는 원문을 상태에 쓰지 않는다.
+_SAFE_RUN_ERRORS = (
+    cloud_lookup.LookupFailed, ExecutionModelError, StartCheckError, VpnError, ConnectivityError, CatalogError,
+    JobRequestError, MissingSetting, preflight.PreflightError, AgentError,
+)
+_STAGE_MESSAGES = {"vpn": "VPN 구축 중", "probe": "DB 접속 확인 중", "secrets": "DB 계정 전달과 작업 등록 중"}
+_STAGE_STEPS = {"vpn": 7, "probe": 8, "secrets": 10, "job": 10}
+# code 속성이 없는 오류의 코드. 화면은 이 값으로 안내를 나눈다.
+_ERROR_CODES = (
+    (cloud_lookup.LookupFailed, "lookup_failed"),
+    (ExecutionModelError, "invalid_route"),
+    (ConnectivityError, "db_unreachable"),
+    (MissingSetting, "missing_setting"),
+    (preflight.PreflightError, "preflight_failed"),
+    (AgentError, "agent_error"),
+    (httpx.HTTPError, "agent_unreachable"),
+)
 
 class NotAllowed(RuntimeError):
     """지금 상태에서는 할 수 없는 호출."""
@@ -135,6 +182,14 @@ class _Progress:
     message: str | None = None
     source: tuple[str, str] | None = None
     job_registered: bool = False
+    route: Route | None = None
+    target_network: str | None = None
+    lookup: cloud_lookup.FoundRoute | None = None
+    execution: ExecutionModel | None = None
+    # 004의 단계 번호. 작업 등록 전 어디까지 왔는지(실패했다면 어디서 멈췄는지)를 말한다.
+    step: int = 3
+    error_code: str | None = None
+    database_choices: DatabaseChoices | None = None
 
 
 _active: set[str] = set()
@@ -150,36 +205,216 @@ _active_lock = threading.Lock()
 # ---- 공개 함수 ----
 
 
-def run(inp: StartInput | dict, *, discover: Discover | None = None, agent: CdcAgentClient | None = None,
-        ctx: Reporter | None = None) -> str:
+def run(inp: Any, *, agent: CdcAgentClient | None = None, ctx: Reporter | None = None) -> str:
     """입력을 검사·저장하고 run_id를 바로 돌려준다. 이후 실패는 status에 나온다."""
-    try:
-        start = StartInput.model_validate(inp)
-    except ValidationError as exc:
-        raise InvalidInput(_input_problems(exc)) from None
-    if start.source is None and discover is None:
-        raise InvalidInput(["source"])
-    if start.source is not None and start.source.region != start.region:
-        raise InvalidInput(["source.region"])
-
-    if start.run_id:
-        _refuse_ended_run(start.run_id, agent)
-    run_id = start.run_id or _new_run_id()
+    parsed = parse(inp)
+    if parsed.run_id:
+        _refuse_ended_run(parsed.run_id, agent)
+    run_id = parsed.run_id or _new_run_id()
     if not _reserve(run_id):
         raise NotAllowed(BUSY_MESSAGE.format(run_id=run_id))
     try:
-        cloud_ref, admin_ref = _save_inputs(run_id, start)
+        injected = inject(run_id, parsed)
     except BaseException:
+        with _active_lock:
+            _runs.pop(run_id, None)
         _release(run_id)
         raise
-    # 스레드에는 비밀값 없이 이름표만 넘긴다.
-    threading.Thread(
-        target=_run_in_background,
-        args=(run_id, start.region, start.target, start.source, start.options, cloud_ref, admin_ref),
-        kwargs={"discover": discover, "agent": agent, "ctx": ctx},
-        name=f"cdc-run-{run_id}", daemon=True,
-    ).start()
+    _start_background(injected, agent, ctx)
     return run_id
+
+
+def retry(run_id: str, request: RetryRequest | None = None, *, agent: CdcAgentClient | None = None,
+          ctx: Reporter | None = None) -> str:
+    """저장된 입력으로 이어서 실행한다. 비밀번호를 다시 받지 않는다. 고른 DB 이름만 받는다."""
+    request = request or RetryRequest()
+    _refuse_ended_run(run_id, agent)
+    if not _reserve(run_id):
+        raise NotAllowed(BUSY_MESSAGE.format(run_id=run_id))
+    try:
+        injected = reload_run(run_id, source_database=request.source_database, target_database=request.target_database)
+    except NoSavedInput:
+        with _active_lock:
+            _runs.pop(run_id, None)
+        _release(run_id)
+        raise NotAllowed(f"run {run_id} has no saved inputs; start it again with POST /runs") from None
+    except BaseException:
+        with _active_lock:
+            _runs.pop(run_id, None)
+        _release(run_id)
+        raise
+    _start_background(injected, agent, ctx)
+    return run_id
+
+
+def list_runs() -> list[RunSummary]:
+    """정리할 것이 남았거나 실행 중인 run. 깨끗하게 끝난 run은 목록에서 뺀다."""
+    with _active_lock:
+        active = _active | _cleaning
+    runs, finished = [], []
+    for run_id in known_runs():
+        if run_id in active or _remaining(run_id, None):
+            runs.append(RunSummary(run_id=run_id, route=_route(run_id, None), active=run_id in active))
+        else:
+            finished.append(run_id)
+    if finished:
+        forget_runs(finished)
+    return runs
+
+
+def _start_background(injected: InjectedRun, agent: CdcAgentClient | None, ctx: Reporter | None) -> None:
+    run_id = injected.run_id
+    try:
+        threading.Thread(target=_run_in_background, args=(injected, agent, ctx), daemon=True,
+                         name=f"cdc-run-{run_id}").start()
+    except BaseException:
+        _set_progress(run_id, state="failed", message="실행을 시작하지 못했습니다. 다시 실행하세요.", error_code="internal")
+        _release(run_id)
+        raise
+
+
+def _run_in_background(injected: InjectedRun, agent: CdcAgentClient | None, ctx: Reporter | None) -> None:
+    run_id = injected.run_id
+    job_id = to_job_id(run_id)
+    log = ProgressLog(run_id, job_id)
+    fallback = "DB 조회를 완료하지 못했습니다. 권한과 클라우드 API 상태를 확인하세요."
+
+    def stop_requested() -> bool:
+        with _active_lock:
+            return run_id in _stop_requested
+
+    def hand_off(**fields: Any) -> bool:
+        """stop이 먼저 왔으면 결과를 넘기지 않고 중단으로 끝낸다."""
+        with _active_lock:
+            stopped = run_id in _stop_requested
+            if not stopped:
+                for name, value in fields.items():
+                    setattr(_runs[run_id], name, value)
+        if stopped:
+            message = "작업 등록 전에 중단했습니다."
+            _set_progress(run_id, state="aborted", message=message)
+            _end(ctx, "aborted", 0, message)
+        return not stopped
+
+    try:
+        _set_progress(run_id, step=4, message="DB 주소·네트워크 조회 중")
+        if ctx is not None:
+            ctx.report("running", 0, None, "DB 주소·네트워크 조회 중")
+        found = cloud_lookup.find_route(injected)
+        target_network = cloud_lookup.network_exposure(found.target.db)
+        if not hand_off(lookup=found, target_network=target_network):
+            return
+        save_target_network(run_id, target_network)
+
+        fallback = "실행 모델로 변환하지 못했습니다. 입력과 조회 결과를 확인하세요."
+        _set_progress(run_id, step=5, message="실행 모델로 변환 중")
+        execution = build_execution_model(injected, found)
+        if not hand_off(execution=execution):
+            return
+
+        fallback = "실행을 끝내지 못했습니다. 같은 run_id로 다시 실행하거나 stop으로 정리하세요."
+        _set_progress(run_id, step=6, message="시작 전 검사 중")
+        client = agent or _default_agent()
+        _claim_execution_source(run_id, execution)
+        check_start(StartCheckInput.from_route(execution), job_id=job_id, agent=client, network=CdcNetwork.from_env())
+        accounts = ensure_account_refs(execution)
+        secret_values = job_secrets(
+            Resolved(source_admin=resolve(accounts.source_admin), target_admin=resolve(accounts.target_admin),
+                     target_ddl=resolve(accounts.target_ddl), target_sink=resolve(accounts.target_sink)),
+            resolve(accounts.source_repl),
+        )
+        preflight.check_job_secrets(secret_values)
+
+        def stage(name: str) -> None:
+            _set_progress(run_id, stage=name, step=_STAGE_STEPS[name], message=_STAGE_MESSAGES.get(name))
+            log.event("stage", stage=name)
+
+        def discover_and_build() -> dict:
+            _set_progress(run_id, step=9, message="DB·테이블 조회 중")
+            selection = CatalogSelection(source_database=injected.source_database,
+                                         target_database=injected.target_database)
+            catalog = discover_catalog(execution, agent=client, selection=selection,
+                                       options=CatalogOptions(sslmode=tunables().db_sslmode),
+                                       stop_requested=stop_requested)
+            return build_request(job_id, catalog)
+
+        result = run_migration(
+            run_id, {}, {}, agent=client, ctx=ctx, log=log, stop_requested=stop_requested,
+            steps=_run_steps(injected, found, execution, secret_values, client, stop_requested, log),
+            make_request=discover_and_build, target_network=target_network,
+            on_stage=lambda name: _on_run_stage(run_id, name, stage),
+        )
+        _set_progress(run_id, state=result["state"])
+    except Exception as exc:  # noqa: BLE001 - 스레드 밖으로 나갈 곳이 없으므로 status에 남긴다
+        logger.warning("run %s failed", run_id)
+        message = _run_error_message(run_id, exc, fallback)
+        _set_progress(run_id, state="failed", message=message, error_code=_run_error_code(exc),
+                      database_choices=_database_choices(exc))
+        _end(ctx, "failed", 0, message)
+    finally:
+        _release(run_id)
+
+
+def _run_error_message(run_id: str, exc: Exception, fallback: str) -> str:
+    """API 원문은 상태나 로그에 쓰지 않는다."""
+    if isinstance(exc, DatabaseSelectionRequired):
+        names = "; ".join(f"{side}: {', '.join(found)}" for side, found in exc.candidates.items())
+        return f"DB가 여러 개입니다 ({names}). DB를 골라 다시 실행하세요."
+    if isinstance(exc, _SAFE_RUN_ERRORS):
+        return _clean(run_id, str(exc))
+    if isinstance(exc, httpx.HTTPError):
+        return "CDC agent unreachable"
+    return fallback
+
+
+def _run_error_code(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    if isinstance(code, str):
+        return code
+    for kinds, name in _ERROR_CODES:
+        if isinstance(exc, kinds):
+            return name
+    return "internal"
+
+
+def _database_choices(exc: Exception) -> DatabaseChoices | None:
+    if not isinstance(exc, DatabaseSelectionRequired):
+        return None
+    return DatabaseChoices(source=list(exc.candidates["source"]), target=list(exc.candidates["target"]))
+
+
+def _run_steps(injected: InjectedRun, found: cloud_lookup.FoundRoute, execution: ExecutionModel,
+               secret_values: dict[str, str], agent: CdcAgentClient, stop_requested: Callable[[], bool],
+               log: ProgressLog) -> "Steps":
+    def ensure(job_id: str, source: dict, target: dict) -> None:
+        log.event("vpn.start")
+        started = time.monotonic()
+        result = vpn_workflow.ensure_vpn(VpnPlan.from_route(injected, found))
+        log.event("vpn.ready", seconds=round(time.monotonic() - started), tunnels=result["tunnel_status"],
+                  skipped=result.get("skipped", False))
+
+    def probe(source: dict, target: dict) -> None:
+        settings = tunables()
+        wait_reachable(agent, endpoints_of(execution), wait_s=settings.probe_wait_s, retry_s=settings.probe_retry_s,
+                       stop_requested=stop_requested, on_result=lambda result: log.event("probe", result=result))
+
+    return Steps(
+        ensure_vpn=ensure,
+        probe=probe,
+        deliver_secrets=lambda job_id, source, target: agent.put_secrets(job_id, secret_values),
+        destroy_vpn=lambda job_id: _destroy(injected.run_id),
+    )
+
+
+def _claim_execution_source(run_id: str, execution: ExecutionModel) -> None:
+    """이 앱의 다른 run이 같은 원본 서버를 쓰는지 본다. 에이전트에 등록 전인 run은 에이전트가 모른다."""
+    host = execution.source.db.host
+    with _active_lock:
+        for other in _active:
+            claimed = _runs[other].source if other != run_id and other in _runs else None
+            if claimed is not None and claimed[0] == host:
+                raise StartCheckError("source_busy", "another run on this app already works on the same source DB")
+        _runs[run_id].source = (host, str(execution.source.db.port))
 
 
 def status(run_id: str, *, agent: CdcAgentClient | None = None) -> RunStatus:
@@ -206,16 +441,34 @@ def status(run_id: str, *, agent: CdcAgentClient | None = None) -> RunStatus:
 
     message = job.get("message") or (progress.message if progress else None)
     remaining = _remaining(run_id, job)
+    metrics = to_metrics(job, lambda text: _clean(run_id, text))
+    network = progress.target_network if progress is not None and progress.target_network else _saved_network(run_id)
+    if network:
+        metrics["target_db_network"] = network
+    if still_on_source(job):
+        metrics["serving"] = "source"
+    shown = _clean(run_id, message) if message else None
     return RunStatus(
-        run_id=run_id, job_id=job_id, state=job["state"], phase=job["phase"], progress=job["progress"],
-        message=_clean(run_id, message) if message else None, metrics=job.get("metrics", {}),
+        run_id=run_id, job_id=job_id, route=_route(run_id, progress), state=job["state"], phase=job["phase"],
+        step=step_of_phase(job["phase"]), progress=clamp_progress(job["progress"]), message=shown,
+        error=RunError(code="job_failed", message=shown or "복제 작업이 실패했습니다.") if job["state"] == "failed" else None,
+        metrics=metrics,
         ready_for_cutover=job["phase"] == READY_PHASE and job["state"] == "waiting_approval",
         cleanup_required=job["state"] in CLEANUP_STATES and bool(remaining), remaining=remaining,
     )
 
 
-def cutover(run_id: str, approved_by: str, *, agent: CdcAgentClient | None = None) -> CutoverResult:
-    """cutover_ready에서만 시작한다. 진행 중이면 다시 시작하지 않고 그 결과를 돌려준다."""
+def cutover(
+    run_id: str,
+    approved_by: str,
+    *,
+    agent: CdcAgentClient | None = None,
+    confirm_source: Callable[[], bool] | None = None,
+) -> CutoverResult:
+    """cutover_ready에서만 시작한다. 진행 중이면 다시 시작하지 않고 그 결과를 돌려준다.
+
+    confirm_source는 트래픽이 원본에 있는지 확인한다. 없으면 원본 복귀를 unknown으로 답한다.
+    """
     if not approved_by.strip():
         raise InvalidInput(["approved_by"])
     with _active_lock:
@@ -226,7 +479,7 @@ def cutover(run_id: str, approved_by: str, *, agent: CdcAgentClient | None = Non
     if not owner:
         return pending.result()
     try:
-        result = _start_or_join_cutover(run_id, approved_by, agent or _default_agent())
+        result = _start_or_join_cutover(run_id, approved_by, agent or _default_agent(), confirm_source)
     except BaseException as exc:
         pending.set_exception(exc)
         raise
@@ -255,71 +508,6 @@ def stop(run_id: str, *, agent: CdcAgentClient | None = None) -> FinishResult:
 # ---- run의 백그라운드 절차 ----
 
 
-def _run_in_background(run_id: str, region: str, target: TargetInput, source: SourceInput | None,
-                       options: MigrationOptions, cloud_ref: str, admin_ref: str, *,
-                       discover: Discover | None, agent: CdcAgentClient | None, ctx: Reporter | None) -> None:
-    job_id = to_job_id(run_id)
-    log = ProgressLog(run_id, job_id)
-
-    def stage(name: str) -> None:
-        _set_progress(run_id, stage=name)
-        log.event("stage", stage=name)
-
-    try:
-        client = agent or _default_agent()
-
-        stage("agent_check")
-        preflight.check_agent(client)
-
-        stage("source_lookup")
-        mig = _load_migration(run_id, region, target, source, options, cloud_ref, admin_ref, discover)
-
-        stage("preflight")
-        creds = resolve_inputs(mig)
-        preflight.check_source(mig, creds.source_admin["user"])
-        if not mig.options.skip_vpn:
-            preflight.check_networks(mig, vpn.OciSettings.from_env())
-        _claim_source(run_id, mig)
-        preflight.check_not_running(mig, job_id, client)
-
-        repl = ensure_repl_account(run_id)
-        preflight.check_job_secrets(job_secrets(creds, repl))
-        result = run_migration(
-            run_id, mig.source.model_dump(), mig.target.model_dump(),
-            agent=client, steps=_build_steps(mig, creds, repl, client, log), ctx=ctx,
-            log_interval_s=mig.options.log_interval_s, max_hold_ms=mig.options.max_hold_ms, log=log,
-            stop_requested=lambda: run_id in _stop_requested,
-            on_stage=lambda name: _on_run_stage(run_id, name, stage),
-        )
-        _set_progress(run_id, state=result["state"])
-    except Exception as exc:  # noqa: BLE001 - 스레드 밖으로 나갈 곳이 없으므로 status에 남긴다
-        message = _clean(run_id, str(exc))
-        logger.warning("run %s failed", run_id)
-        log.event("run.ended", state="failed", error=message)
-        _set_progress(run_id, state="failed", message=message)
-        _end(ctx, "failed", 0, message)
-    finally:
-        _release(run_id)
-
-
-def _load_migration(run_id: str, region: str, target: TargetInput, source: SourceInput | None,
-                    options: MigrationOptions, cloud_ref: str, admin_ref: str,
-                    discover: Discover | None) -> DbMigrationInput:
-    if source is not None:
-        data = source.model_dump()
-    else:
-        found = discover(SourceLookup(run_id=run_id, region=region, target_region=target.region,
-                                      cloud_ref=cloud_ref, db_admin_ref=admin_ref))
-        data = found.model_dump() if hasattr(found, "model_dump") else dict(found)
-    tables = [t for t in data.get("tables") or [] if not t.startswith(INTERNAL_SCHEMA_PREFIX)]
-    data = {**data, "region": region, "tables": tables,
-            "credentials_ref": {"cloud": cloud_ref, "db_admin": admin_ref}}
-    try:
-        return DbMigrationInput(run_id=run_id, source=data, target=target, options=options)
-    except ValidationError as exc:
-        raise InvalidInput(_input_problems(exc)) from None
-
-
 def _on_run_stage(run_id: str, name: str, stage: Callable[[str], None]) -> None:
     stage(name)
     if name == "job":
@@ -340,8 +528,13 @@ def run_migration(
     log: ProgressLog | None = None,
     stop_requested: Callable[[], bool] = lambda: False,
     on_stage: Callable[[str], None] = lambda name: None,
+    make_request: Callable[[], dict] | None = None,
+    target_network: str | None = None,
 ) -> dict:
     """VPN → 접속 확인 → 비밀 전달 → 작업 등록 → 복제 지켜보기.
+
+    make_request를 주면 접속 확인 뒤에 작업 요청을 만든다. DB 이름과 테이블은 VPN이 있어야 조회할 수 있다.
+    없으면 source·target으로 시작할 때 만든다 (기존 execute).
 
     멈추는 경우:
     - stop: 도는 run이 aborted를 보고 VPN을 지운다. VPN 생성 중이면 그 단계가 끝난 뒤 작업 없이 지운다.
@@ -355,9 +548,12 @@ def run_migration(
     poll_s = settings.job_poll_s if poll_s is None else poll_s
     log_interval_s = settings.log_interval_s if log_interval_s is None else log_interval_s
 
+    target_network = target_network or network_exposure((target.get("db") or {}).get("private_ip"))
+
     def report(progress: int, metrics: dict | None = None, message: str | None = None) -> None:
         if ctx is not None:
-            ctx.report("running", progress, metrics, message)
+            shared = {"target_db_network": target_network} if target_network else {}
+            ctx.report("running", clamp_progress(progress), {**shared, **(metrics or {})} or None, message)
 
     def check_stop() -> None:
         # 작업 등록 전에는 에이전트로 멈출 수 없다.
@@ -371,7 +567,7 @@ def run_migration(
 
     job_may_exist = False
     try:
-        request = build_job_request(job_id, source, target, max_hold_ms)
+        request = None if make_request else build_job_request(job_id, source, target, max_hold_ms)
         log.event("run.start")
         _refuse_finished(agent, job_id)
         check_stop()
@@ -385,6 +581,10 @@ def run_migration(
         report(1, message="DB 접속 확인")
         steps.probe(source, target)
         check_stop()
+
+        if make_request:
+            request = make_request()
+            check_stop()
 
         on_stage("secrets")
         steps.deliver_secrets(job_id, source, target)
@@ -461,15 +661,18 @@ def _follow(
         if job["phase"] in METRIC_PHASES and time.monotonic() - last_metrics >= log_interval_s:
             last_metrics = time.monotonic()
             log.event("metrics", **{**job.get("metrics", {}), "phase": job["phase"], "progress": job["progress"]})
-        # metrics의 phase는 한 단계 늦을 수 있다.
-        report(job["progress"], {**job.get("metrics", {}), "phase": job["phase"]}, job.get("message") or None)
+        message = job.get("message")
+        report(job["progress"], to_metrics(job, lambda text: _clean(run_id, text)),
+               _clean(run_id, message) if message else None)
         time.sleep(log_interval_s if ready else poll_s)
 
 
 # ---- 컷오버 ----
 
 
-def _start_or_join_cutover(run_id: str, approved_by: str, agent: CdcAgentClient) -> CutoverResult:
+def _start_or_join_cutover(
+    run_id: str, approved_by: str, agent: CdcAgentClient, confirm_source: Callable[[], bool] | None
+) -> CutoverResult:
     job_id = to_job_id(run_id)
     try:
         job = agent.get_job(job_id)
@@ -489,10 +692,12 @@ def _start_or_join_cutover(run_id: str, approved_by: str, agent: CdcAgentClient)
                 raise NotAllowed(_clean(run_id, exc.detail)) from None
     elif job["phase"] != CUTOVER_PHASE and job["phase"] not in SWITCHED_PHASES:
         raise NotAllowed(f"cutover needs phase {READY_PHASE}, the job is {job['state']}/{job['phase']}")
-    return _wait_cutover(run_id, job, agent)
+    return _wait_cutover(run_id, job, agent, confirm_source)
 
 
-def _wait_cutover(run_id: str, job: dict, agent: CdcAgentClient) -> CutoverResult:
+def _wait_cutover(
+    run_id: str, job: dict, agent: CdcAgentClient, confirm_source: Callable[[], bool] | None
+) -> CutoverResult:
     settings = tunables()
     job_id = to_job_id(run_id)
     deadline = time.monotonic() + settings.cutover_wait_s
@@ -504,11 +709,11 @@ def _wait_cutover(run_id: str, job: dict, agent: CdcAgentClient) -> CutoverResul
             if isinstance(exc, AgentError) and exc.status_code < 500:
                 raise
         else:
-            outcome = _cutover_outcome(job)
+            outcome = classify_cutover(job, confirm_source)
             if outcome:
                 return _cutover_result(run_id, job, outcome)
         if time.monotonic() > deadline:
-            return _cutover_result(run_id, job, "timed_out")
+            return _cutover_result(run_id, job, "unknown")
         time.sleep(settings.cutover_poll_s)
 
 
@@ -521,34 +726,24 @@ def _switched(job: dict) -> bool:
     return "switched_to_target" in _cutover_steps(job)
 
 
-def _cutover_outcome(job: dict) -> str | None:
-    if job["state"] in ("failed", "aborted"):
-        return "manual_check"
-    if job["phase"] in SWITCHED_PHASES:
-        return "switched"
-    steps = _cutover_steps(job)
-    # failed 기록 없는 대기 상태는 전환 시작이 아직 읽히지 않은 것이다.
-    if job["phase"] == READY_PHASE and "failed" in steps:
-        # 쓰기 차단 해제 같은 복귀 단계가 실패하면 원본이 막혀 있을 수 있다.
-        return "manual_check" if any(s.endswith("_failed") for s in steps) else "returned_to_source"
-    return None
-
-
-CUTOVER_MESSAGES = {
+CUTOVER_MESSAGES: dict[CutoverOutcome, str] = {
+    "not_started": "전환을 시작하지 않았습니다. 쓰기는 원본으로 갑니다.",
+    "rolled_back": "전환하지 못해 원본으로 복귀했습니다. 쓰기는 원본으로 갑니다. 원인을 확인한 뒤 다시 시도하세요.",
     "switched": "전환이 끝났습니다. 전환 시점 데이터 비교(metrics의 verification)와 안정화를 확인한 뒤 finish를 부르세요.",
-    "returned_to_source": "전환하지 못해 원본으로 복귀했습니다. 쓰기는 원본으로 갑니다. 원인을 확인한 뒤 다시 부를 수 있습니다.",
-    "manual_check": "자동으로 복구하지 못했습니다. 트래픽 방향과 원본 쓰기 차단을 직접 확인하세요.",
-    "timed_out": "기다리는 시간이 지났습니다. 전환은 끝나지 않았을 수 있으니 status로 확인하세요.",
+    "post_switch_failed": "전환 단계에서 실패했습니다. 트래픽이 목적지로 넘어갔을 수 있습니다. 트래픽 방향과 원본 쓰기 차단을 직접 확인하세요.",
+    "unknown": "트래픽 위치를 확인하지 못했습니다. 전환이 아직 진행 중일 수 있으니 status와 트래픽 방향, 원본 쓰기 차단을 직접 확인하세요.",
 }
 
 
-def _cutover_result(run_id: str, job: dict, outcome: str) -> CutoverResult:
+def _cutover_result(run_id: str, job: dict, outcome: CutoverOutcome) -> CutoverResult:
     cutover_evidence = (job.get("evidence") or {}).get("cutover") or {}
     detail = job.get("message") or ""
     return CutoverResult(
         run_id=run_id, job_id=to_job_id(run_id), outcome=outcome, state=job["state"], phase=job["phase"],
         message=CUTOVER_MESSAGES[outcome], detail=_clean(run_id, detail) or None,
-        hold_ms=cutover_evidence.get("hold_ms"), evidence=job.get("evidence", {}),
+        hold_ms=cutover_evidence.get("hold_ms"),
+        metrics={**to_metrics(job, lambda text: _clean(run_id, text)), "cutover_outcome": outcome},
+        evidence=job.get("evidence", {}),
     )
 
 
@@ -621,7 +816,7 @@ def _cleanup_result(run_id: str, job: dict | None, error: str | None) -> FinishR
     cleanup = (job or {}).get("evidence", {}).get("cleanup", {})
     done = error is None and not remaining
     accounts = cleanup.get("target_accounts", {})
-    next_steps = [IAM_NEXT_STEP] if done else []
+    next_steps = _credential_steps(run_id) if done else []
     if accounts.get("error"):
         # 에이전트가 관리자 비밀을 이미 지웠으므로 다시 불러도 해결되지 않는다.
         next_steps.append(TARGET_ACCOUNTS_NEXT_STEP.format(accounts=", ".join(accounts.get("accounts", []))))
@@ -635,6 +830,12 @@ def _cleanup_result(run_id: str, job: dict | None, error: str | None) -> FinishR
         vpn="kept" if has_secret(_ref(run_id, VPN_CONTEXT)) else "removed",
         remaining=remaining, next_steps=next_steps,
     )
+
+
+def _credential_steps(run_id: str) -> list[str]:
+    clouds = saved_clouds(run_id)
+    # workflows 경로는 run별 키를 실제로 지우므로 기존 문구가 맞다.
+    return credential_next_steps(*clouds) if clouds else [IAM_NEXT_STEP]
 
 
 def _remaining(run_id: str, job: dict | None) -> list[str]:
@@ -772,41 +973,17 @@ class Resolved:
     target_sink: dict[str, str]
 
 
-def _save_inputs(run_id: str, start: StartInput) -> tuple[str, str]:
-    cloud = {"aws_access_key_id": start.aws_access_key_id.get_secret_value(),
-             "aws_secret_access_key": start.aws_secret_access_key.get_secret_value()}
-    if start.aws_session_token:
-        cloud["aws_session_token"] = start.aws_session_token.get_secret_value()
-    cloud_ref = put_secret(f"{run_id}/source-cloud", cloud)
-    admin_ref = put_secret(f"{run_id}/source-db-admin", {"user": start.db_user.get_secret_value(),
-                                                         "password": start.db_password.get_secret_value()})
-    given = start.target.credentials_ref
-    others = [ref for ref in (given.cloud, given.admin, given.ddl_user, given.sink_user)
-              if ref and not ref.startswith(f"secret://{run_id}/")]
-    if others:
-        put_secret(f"{run_id}/{OTHER_REFS}", {"refs": json.dumps(others)})
-    return cloud_ref, admin_ref
-
-
-def _ensure_account(ref: str, user: str) -> dict[str, str]:
-    try:
-        return resolve(ref)
-    except KeyError:
-        value = {"user": user, "password": secrets.token_hex(24)}
-        put_secret(ref, value)
-        return value
-
-
 def _target_account(mig: DbMigrationInput, given: str | None, tag: str, user: str) -> dict[str, str]:
     """이름표를 받았으면 값이 있어야 한다. 없으면 run 아래에 저장된 것을 쓰거나 만든다."""
-    return resolve(given) if given else _ensure_account(_ref(mig.run_id, tag), user)
+    return resolve(given) if given else ensure_account(_ref(mig.run_id, tag), user)
 
 
 def resolve_inputs(mig: DbMigrationInput) -> Resolved:
     if not mig.options.skip_vpn:
         # VPN이 직접 읽는 값이다. 구축을 시작한 뒤가 아니라 여기서 실패한다.
         resolve(mig.source.credentials_ref.cloud)
-        resolve(mig.target.credentials_ref.cloud)
+        if not mig.options.pass_onprem:
+            resolve(mig.target.credentials_ref.cloud)
     target = mig.target.credentials_ref
     settings = tunables()
     return Resolved(
@@ -818,7 +995,7 @@ def resolve_inputs(mig: DbMigrationInput) -> Resolved:
 
 
 def ensure_repl_account(run_id: str) -> dict[str, str]:
-    return _ensure_account(_ref(run_id, "source-repl"), tunables().repl_user)
+    return ensure_account(_ref(run_id, "source-repl"), tunables().repl_user)
 
 
 def job_secrets(creds: Resolved, repl: dict[str, str]) -> dict[str, str]:
@@ -882,17 +1059,8 @@ def _probe(agent: CdcAgentClient, mig: DbMigrationInput, log: ProgressLog) -> No
     endpoints = [{"host": mig.source.db.host, "port": mig.source.db.port},
                  {"host": mig.target.db.private_ip, "port": mig.target.db.port}]
     settings = tunables()
-    # 터널이 올라온 뒤 경로가 퍼지는 데 시간이 걸린다.
-    deadline = time.monotonic() + (0 if mig.options.skip_vpn else settings.probe_wait_s)
-    while True:
-        result = agent.probe(endpoints)
-        log.event("probe", result=result)
-        unreachable = [f"{r['host']}:{r['port']}" for r in result if not r["ok"]]
-        if not unreachable:
-            return
-        if time.monotonic() > deadline:
-            raise RuntimeError(f"not reachable from the CDC nodes: {', '.join(unreachable)}")
-        time.sleep(settings.probe_retry_s)
+    wait_reachable(agent, endpoints, wait_s=0 if mig.options.skip_vpn else settings.probe_wait_s,
+                   retry_s=settings.probe_retry_s, on_result=lambda result: log.event("probe", result=result))
 
 
 # ---- 작은 도움 함수 ----
@@ -977,17 +1145,48 @@ def _run_result(run_id: str, state: str, job: dict, vpn_destroyed: bool, vpn_err
 
 def _status_from_memory(run_id: str, progress: _Progress) -> RunStatus:
     remaining = _remaining(run_id, None)
+    failed = progress.state == "failed"
+    # 등록된 작업을 잃었다면 전환했는지 알 수 없다.
+    metrics: dict[str, Any] = {} if progress.job_registered else {"serving": "source"}
+    if progress.target_network:
+        metrics["target_db_network"] = progress.target_network
+    if failed and progress.message:
+        metrics["cdc_error"] = progress.message
     return RunStatus(
-        run_id=run_id, job_id=to_job_id(run_id), state=progress.state, phase=progress.stage, progress=0,
-        message=progress.message,
+        run_id=run_id, job_id=to_job_id(run_id), route=_route(run_id, progress), state=progress.state,
+        phase=progress.stage, step=progress.step, progress=0, message=progress.message,
+        error=RunError(code=progress.error_code or "internal", message=progress.message or "실행이 실패했습니다.") if failed else None,
+        database_choices=progress.database_choices,
+        metrics=metrics,
         cleanup_required=progress.state in CLEANUP_STATES and bool(remaining), remaining=remaining,
     )
 
 
 def _unknown_status(run_id: str, message: str) -> RunStatus:
     remaining = _remaining(run_id, None)
-    return RunStatus(run_id=run_id, job_id=to_job_id(run_id), state="unknown", phase="unknown", progress=0,
-                     message=message, cleanup_required=bool(remaining), remaining=remaining)
+    return RunStatus(run_id=run_id, job_id=to_job_id(run_id), route=_route(run_id, None), state="unknown",
+                     error=RunError(code="status_unknown", message=message),
+                     phase="unknown", progress=0, message=message, cleanup_required=bool(remaining),
+                     remaining=remaining)
+
+
+def _saved_network(run_id: str) -> str | None:
+    try:
+        return saved_target_network(run_id)
+    except Exception:  # noqa: BLE001 - 표시용 값이 상태 조회를 막으면 안 된다
+        logger.warning("run %s: could not read its target network", run_id)
+        return None
+
+
+def _route(run_id: str, progress: _Progress | None) -> Route | None:
+    if progress is not None and progress.route is not None:
+        return progress.route
+    try:
+        saved = saved_route(run_id)
+    except Exception:  # noqa: BLE001 - 표시용 값이 상태 조회를 막으면 안 된다
+        logger.warning("run %s: could not read its route", run_id)
+        return None
+    return Route.model_validate(saved) if saved else None
 
 
 def _ref(run_id: str, tag: str) -> str:
@@ -997,7 +1196,9 @@ def _ref(run_id: str, tag: str) -> str:
 def _clean(run_id: str, text: str) -> str:
     values = redact.run_values(run_id, SECRET_TAGS)
     try:
-        values += redact.ref_values(_other_refs(run_id))
+        # 클라우드 권한은 run 밖에 저장되지만 VPN과 조회 오류 문구에 섞일 수 있다.
+        clouds = saved_clouds(run_id) or ()
+        values += redact.ref_values([*_other_refs(run_id), *(f"secret://cloud/{cloud}" for cloud in clouds)])
     except Exception:  # noqa: BLE001 - 비밀값 저장소 오류가 정리 중인 오류를 가리면 안 된다
         logger.warning("run %s: could not read its other references", run_id)
     return redact.clean(text, values)
@@ -1034,8 +1235,11 @@ def _release(run_id: str) -> None:
 def _set_progress(run_id: str, **fields: Any) -> None:
     with _active_lock:
         progress = _runs[run_id]
+        changed = fields.get("message") not in (None, progress.message)
         for name, value in fields.items():
             setattr(progress, name, value)
+    if changed:
+        ProgressLog(run_id, to_job_id(run_id)).event("progress", message=fields["message"])
 
 
 def _claim_source(run_id: str, mig: DbMigrationInput) -> None:
@@ -1079,6 +1283,14 @@ def execute(inp: DbMigrationInput | dict, ctx: Reporter | None = None, *,
     if not _reserve(mig.run_id):
         message = BUSY_MESSAGE.format(run_id=mig.run_id)
         return DbMigrationResult(run_id=mig.run_id, job_id=job_id, state="failed", message=message)
+    _set_progress(
+        mig.run_id,
+        route=Route(
+            source={"cloud": mig.source.cloud, "region": mig.source.region},
+            target={"cloud": mig.target.cloud, "region": mig.target.region},
+        ),
+        target_network=network_exposure(mig.target.db.private_ip),
+    )
     try:
         log.event("inputs.loaded", source_host=mig.source.db.host, target_host=mig.target.db.private_ip,
                   tables=len(mig.source.tables), skip_vpn=mig.options.skip_vpn)

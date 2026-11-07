@@ -20,6 +20,20 @@ export const STAGE_ORDER: StageName[] = ["discovery", "planning", "provisioning"
 
 export const GATE_BEFORE: Partial<Record<StageName, Gate>> = { provisioning: "plan", cutover: "cutover" };
 
+/** 원본 클라우드. aws 는 기존 조회, gcp·azure 는 cloud_source 위치의 앱·DB 를 클라우드 API 로 조회합니다. */
+export type SourceKind = "aws" | "gcp" | "azure";
+
+/** 원본이 GCP·Azure 일 때 원본 위치. 비밀은 secret:// 이름표만 받습니다. */
+export interface CloudSourceRequest {
+  region: string;
+  app_name: string;
+  db_instance: string;
+  credentials_ref?: string | null;
+  project_id?: string | null; // GCP
+  subscription_id?: string | null; // Azure
+  resource_group?: string | null; // Azure
+}
+
 export interface MigrationRequest {
   github_repo_url?: string | null;
   service_name?: string | null;
@@ -32,6 +46,8 @@ export interface MigrationRequest {
   db_admin_ref?: string | null;
   target_region?: string;
   target_infra?: TargetInfraConfig | null;
+  source_kind?: SourceKind | "manual";
+  cloud_source?: CloudSourceRequest | null;
 }
 
 /** 화면에 보이는 run 이름. 예전 요청에는 저장소 주소만 있습니다. */
@@ -68,7 +84,7 @@ export interface RunStatus {
   updated_at: string;
   approval_records: ApprovalRecord[];
   cutover_readiness?: CutoverReadiness | null; // 승인 ② 대기 중일 때만 서버가 채웁니다
-  cleanup_state?: "running" | "done" | "failed" | null; // 중단 뒤 복제 자원 정리 상태
+  cleanup_state?: "running" | "done" | "failed" | null; // 복제 자원 정리 상태 (중단 뒤, 또는 전환이 끝난 뒤 이전 자원 정리)
   cleanup_message?: string | null;
   cdc_job_id?: string | null; // 단건 응답에만 있습니다. CDC 작업 직접 제어에 씁니다
 }
@@ -129,7 +145,11 @@ export interface SelfHealingDiagnosis {
   root_cause: string;
   action_plan: string[];
   suggested_manual_input?: Record<string, unknown> | null;
-  diagnosed_by: "ai" | "rule";
+  diagnosed_by: "ai" | "rule" | "reasoning_bank";
+  /** 과거에 풀린 같은 장애의 기억으로 낸 진단인지 (ReasoningBank, #77) */
+  memory_hit?: boolean;
+  /** 그 기억의 과거 성공률 (0~1). 기억이 아니면 없음 */
+  prior_success_rate?: number | null;
 }
 
 export class ApiError extends Error {
@@ -200,6 +220,8 @@ export const workflows = {
     post<RunStatus>(`/${encodeURIComponent(runId)}/abort`, { reason: reason || null }),
   resume: (runId: string) => post<RunStatus>(`/${encodeURIComponent(runId)}/resume`),
   retryCleanup: (runId: string) => post<RunStatus>(`/${encodeURIComponent(runId)}/cleanup`),
+  // 전환이 끝난 run 의 복제 작업·VPN 정리. 실패하면 같은 요청으로 다시 시도합니다.
+  decommission: (runId: string) => post<RunStatus>(`/${encodeURIComponent(runId)}/decommission`),
   submitManual: (runId: string, stage: StageName, output: Record<string, unknown>, note?: string) =>
     post<RunStatus>(`/${encodeURIComponent(runId)}/stages/${stage}/manual`, { output, note: note || null }),
   getDiagnosis: (runId: string) => call<SelfHealingDiagnosis>(`/${encodeURIComponent(runId)}/diagnosis`),

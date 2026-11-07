@@ -161,8 +161,8 @@ _CDC_TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$")  # job_req
 
 def cdc_refusals(tables: list[dict]) -> list[str]:
     """CDC(db_migration)가 작업 등록 때 거절하는 테이블. 승인 전에 미리 알린다. PK 없음은 rules.py 가 판정."""
-    checks = (("파티션 테이블은 CDC 가 지원하지 않음", lambda t: t["partitioned"]),
-              ("원본 계정이 SELECT 할 수 없음", lambda t: t["can_select"] is False),
+    checks = (("파티션 테이블은 CDC 가 지원하지 않음", lambda t: t.get("partitioned")),
+              ("원본 계정이 SELECT 할 수 없음", lambda t: t.get("can_select") is False),
               ("테이블 이름이 소문자 규칙이 아님", lambda t: not _CDC_TABLE_NAME.fullmatch(t["qualified"])))
     out = []
     for why, bad in checks:

@@ -62,8 +62,10 @@ def check_networks(mig: DbMigrationInput, settings: OciSettings) -> None:
     if mig.options.skip_vpn:
         return
     source = _networks("source.network.cidr", [mig.source.network.cidr])
-    target = _networks("target.network.subnet_cidrs", mig.target.network.subnet_cidrs)
-    target += _networks("target.network.psa_range_cidr", [mig.target.network.psa_range_cidr])
+    target = []
+    if not mig.options.pass_onprem:
+        target = _networks("target.network.subnet_cidrs", mig.target.network.subnet_cidrs)
+        target += _networks("target.network.psa_range_cidr", [mig.target.network.psa_range_cidr])
     vcn = _networks("CDC_OCI_VCN_CIDR", [settings.vcn_cidr])
     node = _networks("CDC_NODE_SUBNET_CIDR", [settings.node_subnet_cidr])
     if not node[0][1].subnet_of(vcn[0][1]):

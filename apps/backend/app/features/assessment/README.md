@@ -43,20 +43,25 @@ python -m app.features.assessment.cli --profile <읽기 전용 프로필> --aws-
 | `pg_connect.py` · `pg_tables.py` | 김준석 | PG 읽기 전용 접속(psycopg 가 있으면 사용, 없으면 psql) · 카탈로그 → `TableInfo`·`wal_level` |
 | `app.py` | 이주호 | ECS·ECR 조회 → `AppAssessment` |
 | `manual.py` | 이주호 | `source_kind="manual"`: 사람이 입력한 원본 값 → `DbAssessment`·`AppAssessment` (AWS 조회와 같은 형식). 확인 안 한 값이라 gaps 에 '직접 입력' 을 남기고, 비밀처럼 보이는 환경 변수는 버림 |
+| `cloud_source.py` | 이주호 | `source_kind="gcp"`·`"azure"`: 클라우드 API(REST, 읽기 전용 GET)로 원본 앱·DB 를 조회해 같은 형식을 만듦. GCP = Cloud Run v2 + Cloud SQL Admin v1, Azure = Container Apps + PostgreSQL Flexible Server. 비밀 값은 읽지 않고 참조 이름만, 모르는 값은 None. 테이블은 DB 에 직접 붙을 수 있을 때만 읽고, 못 붙으면 gaps |
 | `plan.py` · `rules.py` | 이주호 | 필수 조건 판정, 목적지 매핑, risks·summary |
+| `targets.py` | 이주호 | 목적지(GCP·AWS·Azure)별 컨테이너 호환 규칙·크기 한도·서비스 이름. 근거 문서 링크는 파일 머리말 |
 | `ai.py` | 이주호 | AI 보강 (기본 꺼짐, `ALPHA_AI_ENABLED=1` + `pip install -e ".[ai]"`). summary 3줄·설명용 risks 만. 판정·target_infra 는 안 바꿈, 실패하면 규칙 결과 |
+| `ai_mapping.py` | 이주호 | AI 제안 (같은 스위치). 규칙에 없는 환경 변수 이름의 목적지 대응·빠진 의존성을 `plan.suggestions` 에만 덧붙임. 판정·target_infra 는 안 바꿈. 비밀은 보내지 않고, 제안은 입력에 없는 이름·지어낸 숫자·주소를 항목별로 버림. 실패하면 빈 목록. 평가: `scripts/eval_assessment_ai_mapping.py` |
 | `cli.py` | 이주호 | 실제 원본 조회 → JSON (기본으로 가림) |
 
 ## 입력 — `AssessmentInput` (workflows → assessment)
 | 필드 | 설명 |
 | --- | --- |
 | `run_id`, `github_repo_url` | workflows · 사용자 |
-| `source_kind` | 원본 읽는 방법. `aws`(기본, AWS 계정 조회) / `gcp` · `azure`(관리형 PostgreSQL 조회, 선택 의존성 `.[cloud-sources]`) / `manual`(직접 입력). 어느 쪽이든 출력 형식은 같음 |
+| `source_kind` | 원본 읽는 방법. `aws`(기본, AWS 계정 조회) / `manual`(직접 입력) / `gcp`·`azure`(클라우드 API 조회). 어느 쪽이든 출력 형식은 같음 |
+| `cloud_source` | `source_kind="gcp"`·`"azure"` 면 필수. `{region, app_name, db_instance, credentials_ref, project_id(GCP), subscription_id·resource_group(Azure)}`. GCP `credentials_ref` 는 서비스 계정 키 JSON 이름표(비우면 서버 ADC), Azure 는 `{tenant_id, client_id, client_secret}` 이름표(필수). 필요한 권한: GCP `roles/run.viewer`·`roles/cloudsql.viewer`, Azure `Reader` |
 | `manual` | `source_kind="manual"` 이면 필수. `{cloud, region, app: {service_name, image_uri, container_port, vcpu, memory_mib, health_check_path, env_vars, db_user}, db: {engine_version, host, port, database_name, memory_gib, vcpu, storage_gb, publicly_accessible, logical_replication, tables}}`. 모르는 값은 비우면 '확인 안 됨'·기본값 |
 | `aws_credentials_ref` | `source_kind="aws"` 면 필수. 원본 AWS 키 이름표. `secret://...`(backend DB, `core/secrets.resolve`) 또는 로컬 개발용 `profile:<이름>`(`ALPHA_ALLOW_AWS_PROFILE=1` 일 때만, cli.py 가 켬). 저장 값은 `{aws_access_key_id, aws_secret_access_key, aws_session_token?}` (#31 `source-cloud` 와 같음) |
 | `db_admin_ref` | 원본 DB 관리자 계정 이름표 (db.py 가 PG 카탈로그 조회에 사용) |
 | `aws_region` / `target_region` | 원본 AWS 리전(`source_kind="aws"` 면 필수) / 목적지 리전 |
 | `db_instance_id`, `gcp_project`, `azure_subscription_id` | gcp/azure 원본 식별. `db_instance_id` 는 gcp=인스턴스 이름, azure=`<리소스그룹>/<서버>` (비우면 `rds_instance_id`). 프로젝트·구독은 비우면 환경변수 `ALPHA_GCP_PROJECT` · `ALPHA_AZURE_SUBSCRIPTION_ID` |
+| `target_cloud` | 목적지 클라우드 `gcp`(기본)·`aws`·`azure`·`ncp`. workflows 가 `target_infra.provider` 를 넘김. 호환 검사·단계·요약 문구가 이 기준 |
 | `ecs_cluster`, `ecs_service`, `rds_instance_id` | 선택. 후보가 여러 개일 때만. 비우면 하나뿐일 때 자동 선택, 여러 개면 고르지 않고 gaps |
 
 ## 출력 — `AssessmentOutput`
@@ -87,9 +92,9 @@ python -m app.features.assessment.cli --profile <읽기 전용 프로필> --aws-
 `ecr:DescribeImages`, `elasticloadbalancing:DescribeTargetGroups`
 
 - 이미지·포트·CPU·메모리·환경 변수·비밀 참조(ARN)는 태스크 정의, digest 는 ECR, 상태 확인 경로는 컨테이너 healthCheck → 없으면 로드밸런서 대상 그룹.
-- **Cloud Run 호환 검사**(`cloud_run_compatible`): 태스크 정의에 Cloud Run 으로 옮길 수 없는 설정이 있으면 fail 입니다 — `privileged`, 호스트 장치·capability 추가, UDP 포트, GPU, ARM64, `pidMode`·`ipcMode` 공유, 호스트 경로·Docker 볼륨 마운트, Cloud Run 최대 크기(8 vCPU · 32768 MiB) 초과. 시작 명령 재정의, 함께 도는 다른 컨테이너, EFS·임시 볼륨, App Mesh 는 승인을 막지 않고 risks 에 남깁니다. 값(명령어·경로)은 읽지 않고 설정 이름만 남기며, 직접 입력 원본은 태스크 정의가 없어 이 검사가 빠집니다.
+- **목적지 호환 검사**(`target_platform_compatible`): 원본 설정을 클라우드 중립 코드로 남기고(`app.py`·`cloud_source.py`), 옮길 수 있는지는 목적지(`target_cloud`)마다 `targets.py` 가 판정합니다. 대상 설정 — `privileged`, 호스트 장치, capability 추가(SYS_PTRACE 따로), UDP 포트, TCP 인그레스·인그레스 없음, GPU, ARM64, `pidMode`·`ipcMode`=host, 호스트 경로·Docker 볼륨 마운트 — 과 크기 한도(Cloud Run 8 vCPU·32768 MiB, 이번 AWS 매핑 4 vCPU·30720 MiB, 이번 Azure 매핑 2 vCPU·4096 MiB). 같은 설정도 목적지마다 결과가 다릅니다 (예: SYS_PTRACE 추가는 Fargate 에서 통과, Cloud Run 에서 fail). 문서로 확인하지 못한 조합은 unknown 이라 승인을 막습니다 (Azure 의 장치·capability·호스트 경로 등, 규칙이 없는 ncp 전체). AWS·Azure 크기 한도는 provisioning 이 실제로 만드는 최대 크기와 같아야 하며 `tests/assessment/test_target_platform.py` 가 비교합니다. 시작 명령 재정의, 함께 도는 다른 컨테이너, EFS·임시 볼륨, App Mesh 는 승인을 막지 않고 risks 에 남깁니다. 값(명령어·경로)은 읽지 않고 설정 이름만 남기며, 직접 입력 원본은 태스크 정의가 없어 크기만 봅니다.
 - 앱 DB 사용자는 태스크 정의의 `PGUSER` → `source.app.db_user`, `target_infra.db_user`.
-- 평문 환경 변수 중 이름이 비밀처럼 보이는 것(`PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`, `…_KEY` …)은 **값을 버리고** gaps 에 남깁니다.
+- 평문 환경 변수 중 이름이 비밀처럼 보이는 것(`PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`, `…_KEY` …)은 **값을 버리고** gaps 에 남깁니다. 목적지에서 앱이 값을 못 받으니 승인자가 알아야 하기 때문입니다. 단, provisioning 이 목적지에서 직접 채우는 이름(`PGPASSWORD` 등 `PROVISIONING_INJECTED_ENV`)은 값만 버리고 gaps 에는 남기지 않습니다 (승인자가 할 일이 없는 경고라서 "원본 수집 누락"으로 보였던 문제, #79).
 - 이름이 평범해도 값에 비밀이 들어 있으면(`postgres://user:비밀번호@…` 같은 접속 주소, AWS 액세스 키, 개인키, JWT, 알려진 API 토큰 형식) 똑같이 값을 버립니다. gaps 에는 이름만 남깁니다.
 - AI 보강(`ai.py`)에 보내는 계획에서는 AWS 계정 ID 를 `<aws-account>` 로 가립니다.
 - AWS 오류는 메시지 대신 오류 코드만 남깁니다.
@@ -107,7 +112,7 @@ provisioning 도 같은 키 이름표(`source.credentials_ref.cloud`)를 `resolv
 | Fargate 메모리 MiB | `memory` (MiB, 숫자) | 최소 512 |
 | RDS PostgreSQL 10~16 | `db_version` = `"16"` | 16 초과(다운그레이드)·10 미만은 fail |
 | RDS 인스턴스 클래스 | `db_tier` | 원본 메모리 이상인 가장 작은 등급. 지금은 micro(1GiB) → `db-g1-small` 만. 그 외는 넘기지 않음(기본값) |
-| RDS 인스턴스 클래스 | `db_memory_gib` · `db_vcpu` | 클라우드 중립 DB 크기 (원본 메모리·vCPU). 목적지마다 자기 등급으로 바꿈. 표에 있는 micro·small 만, 그 외는 넘기지 않음. GCP Terraform 에는 안 넘어감 |
+| RDS 인스턴스 클래스 | `db_memory_gib` · `db_vcpu` | 클라우드 중립 DB 크기 (원본 메모리·vCPU). 목적지마다 자기 등급으로 바꿈 (Azure·AWS는 provisioning 의 설정 카드가 원본 메모리 이상인 가장 작은 등급으로 변환). `rules.py` 의 `_RDS_CLASS_SIZES` 표(t3·t4g·m5·m6g·m6i·m7g·m7i·r5·r6g·r6i 등 142개 클래스, EC2 API 로 확인)에 있는 클래스만, 그 외는 넘기지 않음. GCP Terraform 에는 안 넘어감 |
 | RDS 디스크 GB | `db_disk_size_gb` | 원본과 같게, 최소 10 |
 | 환경 변수 | `env_vars` | PG*·APP_ENV·PORT 는 provisioning 이 채우므로 제외 |
 | 비밀 참조 | `secret_refs` | 이름 → `{service_name}-{변수명 소문자}`. 값 이전은 별도 작업 |

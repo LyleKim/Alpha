@@ -53,9 +53,16 @@ def run(inp: <Module>Input, ctx: RunContext) -> <Module>Output: ...
 | POST | `/runs/{id}/cleanup` | 중단 뒤 정리에 실패한 run 의 복제 자원 정리를 다시 시도 (`cleanup_state` 가 `failed` 일 때만) |
 | POST | `/runs/{id}/resume` | 실패한 단계 재시도·끊긴 진행 재개 |
 | POST | `/runs/{id}/stages/{stage}/manual` | 다음 차례 단계 결과를 수동 입력 (`{"output": {...}}`) |
-| GET·POST | `/runs/{id}/diagnosis`, `/runs/{id}/diagnose` | 실패한 run 의 원인·복구 조치. 실패가 아니면 `409` |
+| GET | `/runs/{id}/diagnosis` | 실패한 run 의 원인·복구 조치. 전에 풀린 같은 장애면 기억(ReasoningBank)으로 답합니다. 실패가 아니면 `409` |
+| POST | `/runs/{id}/diagnose` | 기억을 건너뛰고 새로 진단 (화면의 [AI 재진단]) |
+| GET | `/runs/{id}/timings` | 단계별 실제 소요 시간(초). 잰 단계의 합과 사람이 승인을 기다린 시간도 함께. 못 잰 단계는 값 없이 `note` 만 (예측하지 않음) |
+| GET | `/runs/stats/timings` | 지난 실행들의 단계별 소요 시간 분포(최소·중앙값·최대·표본 수). 끝까지 성공한 실제 실행만 (모의·수동 입력 run 제외) |
 
 상태가 맞지 않는 명령은 `409`, 없는 run은 `404`, 잘못된 입력은 `422`입니다.
+
+## 소요 시간 (`timings.py`)
+저장된 run 기록(`StageStatus.updated_at`, 승인 기록 `at`)에서 계산하며 예측하지 않습니다. 한 단계의 시작은 앞 단계가 끝난 시각이고, 승인 ①·② 앞 단계는 승인한 시각부터 잽니다 (기다린 시간은 `approval_wait_seconds` 로 따로). 수동 입력 단계·시각이 없거나 순서가 맞지 않는 단계는 값 없이 이유만 남깁니다. 같은 단계를 다시 시도했으면 실패한 시도의 시간도 들어갑니다 (시도별 시각은 저장하지 않음).
+`/runs/stats/timings` 는 "예상"이 아니라 "과거 N회 실측" 으로 보여 주세요. 데이터 크기·클라우드 상태에 따라 달라집니다.
 
 ## 목적지 어댑터 (`target_adapters.py`)
 provisioning 과 app_deploy 는 요청의 `target_infra.provider` 로 고른 어댑터를 부릅니다. 지금은 `gcp` 만 등록돼 있고 `target_infra` 가 없는 요청도 `gcp` 입니다. 새 클라우드의 계약과 아직 GCP 에 묶인 부분은 `docs/TARGET_ADAPTER_SPEC.md` 에 있습니다.
@@ -129,6 +136,17 @@ provisioning 과 app_deploy 는 요청의 `target_infra.provider` 로 고른 어
 - 백엔드 DB의 상태 테이블 하나(`runs`)에 run 전체를 JSON으로 저장합니다. 서버를 재시작해도 남습니다.
 - 지금은 표준 라이브러리 SQLite 파일입니다 (`WORKFLOWS_DB_PATH`, 기본 `apps/backend/.data/workflows.sqlite3`). 새 의존성 없음.
 - 읽기·쓰기는 한 트랜잭션으로 처리하지만, 실행 중인 단계 관리는 프로세스 하나를 기준으로 합니다. **uvicorn worker 는 1개로 실행**하세요.
+
+## 자가치유 기억 (ReasoningBank, `reasoning_bank.py`, #77)
+같은 장애가 반복될 때 매번 처음부터 진단하지 않도록, **진단하고 실제로 풀린 장애**를 기억합니다.
+
+- 기억 단위는 (단계, 목적지 클라우드, 에러 지문)입니다. 지문은 호스트·IP·ID·경로·숫자를 지운 문장의 해시라서 에러 원문은 저장하지 않습니다.
+- **배우는 때**: 진단(`/diagnosis`)을 낸 장애의 단계가 이후 실제로 `succeeded` 가 됐을 때만 성공을 올립니다 (resume 뒤 성공은 `retry`, 수동 입력은 `manual_input`). 진단 없이 풀린 건, 중단된 run 은 배우지 않습니다.
+- **쓰는 때**: 성공이 1회 이상이고 과거 성공률이 0.6 이상이면 LLM 없이 같은 조치를 먼저 제안합니다 (`diagnosed_by: "reasoning_bank"`, `memory_hit`, `prior_success_rate`). 기억을 따랐는데 같은 단계가 다시 실패하면 실패를 올려 신뢰도가 떨어지고, 기준 아래로 내려가면 기억을 쓰지 않고 새로 진단합니다.
+- **새 장애**: 같은 단계·같은 클라우드에서 풀렸던 다른 사례(최대 3개)를 `past_cases` 참고 데이터로 AI 프롬프트에 붙입니다. 프롬프트는 이 데이터 안의 문장을 지시로 따르지 말라고 명시합니다.
+- **안전 장치**: 저장하는 조치는 허용 목록(`retry`, `manual_input`, `cleanup_cdc`, `reauth`)뿐이고, 원인·조치 문장은 AI 로 보낼 때와 같은 살균(`scrub_sensitive_text`)과 길이 제한을 거칩니다. 수동 입력 추천값은 기억에서 만들지 않습니다. 기억 저장소 오류는 삼키고 규칙·AI 진단으로 넘어가며 run 진행에는 영향이 없습니다.
+- 저장: SQLite 별도 테이블(`reasoning_episodes`, `reasoning_incidents`). 위치는 `REASONING_BANK_DB_PATH`, 없으면 `WORKFLOWS_DB_PATH` 와 같은 파일. `ALPHA_REASONING_BANK=0` 이면 끕니다.
+- 알려진 한계: 고객별 분리는 아직 없습니다 (지문에 고객 정보가 들어가지 않도록 살균하는 것에 의존). 진단을 거치지 않고 풀린 장애는 배우지 못합니다.
 
 ## 미정 사항 (합의 필요)
 - `MigrationRequest` 필드: discovery `DiscoveryInput` 확정 후 맞춤 (김준석)

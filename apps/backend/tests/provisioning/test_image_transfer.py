@@ -490,9 +490,28 @@ def test_a_non_ecr_source_is_copied_without_a_source_login():
     assert [login.registry for login in copier.calls[0][2]] == ["asia-northeast3-docker.pkg.dev"]
 
 
-def test_transfer_rejects_a_malformed_destination_registry():
+@pytest.mark.parametrize("registry_url", ["", "https://acr.azurecr.io", "acr .azurecr.io", "/only-path"])
+def test_transfer_rejects_a_malformed_destination_registry(registry_url):
     with pytest.raises(ProvisioningError, match="registry_url"):
-        run_transfer(FakeCopier(), registry_url="no-slash")
+        run_transfer(FakeCopier(), registry_url=registry_url)
+
+
+@pytest.mark.parametrize(
+    ("registry_url", "expected_host"),
+    [
+        ("targetapp.azurecr.io", "targetapp.azurecr.io"),  # Azure: 호스트만
+        ("061292478449.dkr.ecr.ap-northeast-2.amazonaws.com", "061292478449.dkr.ecr.ap-northeast-2.amazonaws.com"),  # AWS: 호스트만
+        ("asia-northeast3-docker.pkg.dev/example-project/target-app", "asia-northeast3-docker.pkg.dev"),  # GCP: 호스트/프로젝트/저장소
+    ],
+)
+def test_the_image_goes_under_registry_url_whether_it_is_a_host_or_a_path(registry_url, expected_host):
+    copier = FakeCopier()
+
+    result = run_transfer(copier, registry_url=registry_url, service_name="target-app")
+
+    assert copier.calls[0][1].startswith(f"{registry_url}/target-app:")
+    assert result.container_image == f"{registry_url}/target-app@{DIGEST}"
+    assert copier.calls[0][2][-1].registry == expected_host  # 목적지 로그인은 호스트로 한다
 
 
 def test_transfer_reports_each_step():
@@ -684,3 +703,169 @@ def test_a_failed_copy_stops_before_terraform_plans_or_applies(aws_key):
         deploy(app_input(), broken, tf=tf)
 
     assert "plan" not in tf.calls and "apply" not in tf.calls
+
+
+# ---------------------------------------------------------------------------
+# Azure: 역할 부여 직후 push 재시도, DR 저장소 복사, 로그인이 없는 목적지
+# ---------------------------------------------------------------------------
+
+
+class FlakyCopier:
+    """앞의 몇 번은 권한 오류로 실패하고 그 뒤에 성공하는 가짜."""
+
+    def __init__(self, failures, error="crane copy 실패 (종료 코드 1): UNAUTHORIZED: authentication required"):
+        self.failures = failures
+        self.error = error
+        self.attempts = 0
+
+    def copy(self, source, destination, logins):
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise ImageCopyError(self.error)
+        return DIGEST
+
+
+def test_azure_retries_a_permission_error_right_after_the_role_grant():
+    waits: list[float] = []
+    copier = FlakyCopier(failures=2)
+
+    result = run_transfer(copier, provider="azure", sleep=waits.append)
+
+    assert copier.attempts == 3
+    assert waits == [20.0, 20.0]
+    assert result.digest == DIGEST
+
+
+def test_azure_gives_up_after_the_last_attempt():
+    copier = FlakyCopier(failures=99)
+
+    with pytest.raises(ImageCopyError):
+        run_transfer(copier, provider="azure", sleep=lambda s: None)
+
+    assert copier.attempts == 4
+
+
+def test_azure_does_not_retry_an_error_that_is_not_about_permission():
+    copier = FlakyCopier(failures=99, error="crane copy 실패 (종료 코드 1): MANIFEST_UNKNOWN")
+
+    with pytest.raises(ImageCopyError):
+        run_transfer(copier, provider="azure", sleep=lambda s: pytest.fail("기다리면 안 됩니다"))
+
+    assert copier.attempts == 1
+
+
+def test_gcp_never_retries():
+    copier = FlakyCopier(failures=99)
+
+    with pytest.raises(ImageCopyError):
+        run_transfer(copier, provider="gcp", sleep=lambda s: pytest.fail("기다리면 안 됩니다"))
+
+    assert copier.attempts == 1
+
+
+def with_dr(outputs: dict, url="drregistry.azurecr.io") -> dict:
+    return {**outputs, "dr_registry_url": {"value": url}}
+
+
+def test_with_dr_enabled_the_same_image_is_copied_to_the_dr_registry_too(aws_key):
+    transfer = FakeTransfer()
+    tf = FakeTerraform(outputs=with_app_url(with_dr(json.loads(FIXTURE.read_text(encoding="utf-8")))))
+
+    result, _, ctx = deploy(app_input(), transfer, tf=tf)
+
+    assert [call["registry_url"] for call in transfer.calls] == [
+        "asia-northeast3-docker.pkg.dev/example-project/target-app",
+        "drregistry.azurecr.io",
+    ]
+    assert tf.var_values["container_image"] == PINNED  # 주 앱은 주 저장소 주소를 쓴다
+    assert any("DR 저장소에도 복사 완료" in (m or "") for _, _, m in ctx.calls)
+    assert result.healthy is True
+
+
+def test_without_dr_nothing_extra_is_copied(aws_key):
+    transfer = FakeTransfer()
+
+    deploy(app_input(), transfer)
+
+    assert len(transfer.calls) == 1
+
+
+def test_a_dr_copy_with_a_different_digest_fails(aws_key):
+    class Diverging(FakeTransfer):
+        def __call__(self, **kwargs):
+            result = super().__call__(**kwargs)
+            if len(self.calls) == 2:
+                return TransferResult(container_image=PINNED, source="s", destination="d", digest=OTHER_DIGEST)
+            return result
+
+    tf = FakeTerraform(outputs=with_app_url(with_dr(json.loads(FIXTURE.read_text(encoding="utf-8")))))
+
+    with pytest.raises(ProvisioningError, match="DR"):
+        deploy(app_input(), Diverging(), tf=tf)
+
+
+def test_a_destination_without_a_registry_login_skips_the_copy_instead_of_failing(aws_key, monkeypatch):
+    from app.features.provisioning import service
+
+    monkeypatch.setattr(service, "DESTINATION_LOGINS", {"gcp": object()})
+    transfer = FakeTransfer()
+
+    _, tf, ctx = deploy(app_input(provider="azure"), transfer)
+
+    assert transfer.calls == []
+    assert "container_image" not in tf.var_values
+    assert any("이미지 복사 로그인이 없어" in (m or "") for _, _, m in ctx.calls)
+
+
+# ---------------------------------------------------------------------------
+# AWS 목적지 (ECR)
+# ---------------------------------------------------------------------------
+
+
+def test_aws_destination_login_uses_the_environments_own_aws_login_not_a_key():
+    from app.features.provisioning.image_transfer import DESTINATION_LOGINS, aws_destination_login
+
+    seen = {}
+
+    def fake_login(registry, credentials):
+        seen["registry"], seen["credentials"] = registry, dict(credentials)
+        return RegistryLogin(registry, "AWS", "ecr-token")
+
+    login = aws_destination_login("061292478449.dkr.ecr.ap-northeast-2.amazonaws.com", login=fake_login)
+
+    assert (login.username, login.password) == ("AWS", "ecr-token")
+    assert seen["registry"] == "061292478449.dkr.ecr.ap-northeast-2.amazonaws.com"
+    assert set(seen["credentials"].values()) == {None}  # 키를 주지 않아야 boto3 가 환경의 기본 로그인을 쓴다
+    assert DESTINATION_LOGINS["aws"] is aws_destination_login
+
+
+def test_aws_destination_login_asks_ecr_for_the_registrys_own_account_and_region():
+    from app.features.provisioning.image_transfer import aws_destination_login
+
+    created = {}
+
+    class Client:
+        def get_authorization_token(self, registryIds):
+            created["registry_ids"] = registryIds
+            import base64
+
+            return {"authorizationData": [{"authorizationToken": base64.b64encode(b"AWS:pw-from-ecr").decode()}]}
+
+    def factory(service, **kwargs):
+        created["service"], created["kwargs"] = service, kwargs
+        return Client()
+
+    from app.features.provisioning import image_transfer
+
+    login = image_transfer.aws_ecr_login(
+        "061292478449.dkr.ecr.ap-northeast-2.amazonaws.com",
+        {"access_key_id": None, "secret_access_key": None, "session_token": None},
+        client_factory=factory,
+    )
+
+    assert created["service"] == "ecr"
+    assert created["kwargs"]["region_name"] == "ap-northeast-2"
+    assert created["kwargs"]["aws_access_key_id"] is None  # None 이면 boto3 는 기본 자격 증명 체인을 쓴다
+    assert created["registry_ids"] == ["061292478449"]
+    assert login.password == "pw-from-ecr"
+    assert aws_destination_login  # 공개 이름이 있다

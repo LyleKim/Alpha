@@ -8,7 +8,12 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request
 from fastapi.responses import JSONResponse
 
 from app.core.local_access import require_local_access
-from app.features.db_migration import db_workflow, input_secrets
+from app.features.db_migration import (
+    cloud_credentials,
+    db_workflow,
+    input_secrets,
+    run_input,
+)
 from app.features.db_migration.client import AgentError, AgentSettings, CdcAgentClient
 from app.features.db_migration.schemas import (
     RUN_ID_PATTERN,
@@ -16,12 +21,15 @@ from app.features.db_migration.schemas import (
     CutoverResult,
     FinishResult,
     JobRequest,
+    RetryRequest,
     RunStatus,
+    RunSummary,
 )
 from app.features.db_migration.settings import MissingSetting
 
 router = APIRouter(prefix="/db-migration", tags=["db_migration"], dependencies=[Depends(require_local_access)])
 router.include_router(input_secrets.router)
+router.include_router(cloud_credentials.router)
 
 
 @lru_cache
@@ -67,6 +75,10 @@ def add_exception_handlers(app: FastAPI) -> None:
     def invalid_input(_: Request, exc: db_workflow.InvalidInput) -> JSONResponse:
         return JSONResponse({"detail": str(exc), "fields": exc.fields}, status_code=422)
 
+    @app.exception_handler(run_input.MissingCredentials)
+    def missing_credentials(_: Request, exc: run_input.MissingCredentials) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
     @app.exception_handler(db_workflow.NotAllowed)
     def not_allowed(_: Request, exc: db_workflow.NotAllowed) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=409)
@@ -77,10 +89,21 @@ def add_exception_handlers(app: FastAPI) -> None:
 
 
 @router.post("/runs", status_code=202)
-def start_run(request: Request, body: Annotated[Any, Depends(_json_body)], client: Agent) -> dict:
-    """Save the inputs and start in the background. Follow it with GET /runs/{run_id}."""
-    discover = getattr(request.app.state, "discover_source", None)
-    return {"run_id": db_workflow.run(body, discover=discover, agent=client)}
+def start_run(body: Annotated[Any, Depends(_json_body)], client: Agent) -> dict:
+    """Save the inputs and start the migration in the background; see GET /runs/{run_id}."""
+    return {"run_id": db_workflow.run(body, agent=client)}
+
+
+@router.get("/runs")
+def list_runs() -> list[RunSummary]:
+    """Runs still running or with something left to clean up. Read each one with GET /runs/{run_id}."""
+    return db_workflow.list_runs()
+
+
+@router.post("/runs/{run_id}/retry", status_code=202)
+def retry_run(run_id: RunId, client: Agent, req: RetryRequest | None = None) -> dict:
+    """Continue a failed run from its saved inputs, with the databases chosen from database_choices."""
+    return {"run_id": db_workflow.retry(run_id, req, agent=client)}
 
 
 @router.get("/runs/{run_id}")

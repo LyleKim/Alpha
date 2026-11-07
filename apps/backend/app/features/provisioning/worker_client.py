@@ -71,3 +71,15 @@ class WorkerClient:
         stored = self.get_target()
         if stored != url.rstrip("/"):
             raise ProvisioningError(f"Worker 에 저장된 주소가 다릅니다 (기대 {url}, 실제 {stored})")
+
+    def sync_lag(self, lag_bytes: int) -> dict[str, Any]:
+        """CDC 에이전트의 실시간 복제 지연을 Worker 트래픽 게이트(/control/arbitrage)로 동기화합니다."""
+        return self._send("POST", {"current_lag_bytes": lag_bytes}, command="arbitrage")
+
+    def set_quarantine(self, isolated_nodes: list[str], reroute_target: str | None = None) -> dict[str, Any]:
+        """보안 침해 노드 목록과 우회 대상을 Worker 게이트(/control/quarantine)로 동기화합니다."""
+        return self._send("POST", {"isolated_nodes": isolated_nodes, "reroute_target": reroute_target}, command="quarantine")
+
+    def get_quarantine(self) -> dict[str, Any]:
+        """Worker 의 현재 보안 격리 상태를 조회합니다."""
+        return self._send("GET", command="quarantine")

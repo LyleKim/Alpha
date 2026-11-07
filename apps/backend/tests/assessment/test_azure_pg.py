@@ -142,7 +142,7 @@ def test_no_subscription(monkeypatch):
     assert any("구독" in g for g in run(factory()).gaps)
 
 
-@pytest.mark.parametrize("rid", [None, "srv", "a/b/c", "rg/Bad_Name"])
+@pytest.mark.parametrize("rid", ["srv", "a/b/c", "rg/Bad_Name"])
 def test_bad_id(rid):
     r = run(factory(), rid=rid)
     assert any("형식" in g for g in r.gaps) and r.source_db.instance_id is None
@@ -163,7 +163,7 @@ def test_no_creds_no_leak():
 
 
 def test_integration_never_raises():
-    out = db.collect(AssessmentInput(**KW), None)
+    out = db.collect(AssessmentInput(db_instance_id="rg/srv", **KW), None)
     assert out.gaps
 
 

@@ -32,10 +32,14 @@ module "vpn" {
   oracle_bgp_ip  = each.value.oracle_bgp_ip
   peer_bgp_ip    = each.value.peer_bgp_ip
   shared_secret  = var.shared_secrets[each.key]
+  # 키 끝 번호(source-0, source-1)로 구간 안에서 IP를 나눈다.
+  tunnel_index = tonumber(regex("[01]$", each.key))
+
+  phase_two_dh_group = each.value.phase_two_dh_group
 }
 
 output "oracle_tunnel_ips" {
-  description = "AWS 고객 게이트웨이 IP, GCP 외부 게이트웨이 IP로 넘기는 값"
+  description = "상대 구간에 넘길 OCI 터널 공인 IP. 입력의 터널 키를 그대로 유지한다"
   value       = { for k, v in module.vpn : k => v.oracle_tunnel_ip }
 }
 

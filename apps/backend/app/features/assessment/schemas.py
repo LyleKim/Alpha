@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 # ---------------------------------------------------------------------------
 # 입력
@@ -33,10 +34,11 @@ class AppInfo(BaseModel):
     health_check_path: str | None = None
     env_vars: dict[str, str] = Field(default_factory=dict)  # 비밀이 아닌 환경 변수 이름 → 값
     secret_refs: dict[str, str] = Field(default_factory=dict)  # 환경 변수 이름 → AWS 비밀 참조(ARN). 값 금지
-    # Cloud Run 으로 옮길 수 없는 ECS 설정 (예: privileged, UDP 포트, 호스트 경로 마운트). None = 태스크 정의를 보지 않음(직접 입력)
-    cloud_run_blockers: list[str] | None = None
-    # 옮기되 사람이 확인해야 하는 ECS 설정 (예: 시작 명령 재정의, 함께 도는 다른 컨테이너). 값은 넣지 않고 이름만
-    cloud_run_notes: list[str] = Field(default_factory=list)
+    # 목적지에 따라 막힐 수 있는 원본 설정 코드 (예: "privileged", "udp_port", "host_path_volume:data").
+    # 옮길 수 있는지는 목적지마다 targets.py 가 판정합니다. None = 태스크 정의를 보지 않음(직접 입력)
+    container_settings: list[str] | None = None
+    # 옮기되 사람이 확인해야 하는 원본 설정 (예: 시작 명령 재정의, 함께 도는 다른 컨테이너). 값은 넣지 않고 이름만
+    container_notes: list[str] = Field(default_factory=list)
 
 
 class TableInfo(BaseModel):
@@ -77,10 +79,14 @@ class InventoryForPlanning(BaseModel):
     gaps: list[str] = Field(default_factory=list)  # 조회하지 못한 항목
 
 
-class TargetSelection(BaseModel):
-    """사용자가 고른 목적지."""
+# 목적지 클라우드. workflows 의 TargetInfraType 과 같은 값. 호환 규칙이 없는 목적지(ncp)는 호환 검사가 unknown
+TargetCloud = Literal["gcp", "aws", "azure", "ncp"]
 
-    cloud: Literal["gcp"] = "gcp"
+
+class TargetSelection(BaseModel):
+    """사용자가 고른 목적지. 호환 검사·안내 문구가 이 클라우드 기준으로 바뀝니다 (targets.py)."""
+
+    cloud: TargetCloud = "gcp"
     region: str  # 예: "asia-northeast3"
 
 
@@ -105,7 +111,7 @@ class PlanCheck(BaseModel):
         "primary_keys_present",
         "table_names_supported",
         "replication_slot_available",
-        "cloud_run_compatible",
+        "target_platform_compatible",
         "image_available",
     ]
     title: str
@@ -161,6 +167,17 @@ class TargetInfra(BaseModel):
         return self.model_dump(exclude_none=True)
 
 
+class Suggestion(BaseModel):
+    """AI 가 덧붙인 제안. 판정(checks · approvable)에는 쓰이지 않고 승인자가 참고만 합니다."""
+
+    kind: Literal["service_mapping", "missing_dependency", "needs_confirmation"]
+    subject: str  # 근거가 된 환경 변수 이름. 입력에 실제로 있는 이름만 허용
+    observation: str  # 무엇이 보였는지
+    suggestion: str  # 목적지에서 어떻게 하면 좋을지
+    confidence: Literal["high", "medium", "low"]
+    source: Literal["ai"] = "ai"
+
+
 class MigrationPlan(BaseModel):
     target_infra: TargetInfra
     checks: list[PlanCheck]
@@ -170,6 +187,7 @@ class MigrationPlan(BaseModel):
     steps: list[PlanStep]
     approvable: bool  # 모든 필수 조건이 pass 일 때만 True
     blocking: list[str] = Field(default_factory=list)  # approvable=False 인 이유
+    suggestions: list[Suggestion] = Field(default_factory=list)  # AI 제안(참고용). 꺼져 있으면 항상 빈 목록
     generated_at: datetime
 
 
@@ -215,23 +233,64 @@ class ManualSource(BaseModel):
     db: ManualDb = Field(default_factory=ManualDb)
 
 
+class CloudSource(BaseModel):
+    """source_kind="gcp" / "azure" 일 때 원본 위치. 비밀은 이름표만 받습니다.
+
+    - GCP: project_id · region · app_name(Cloud Run 서비스) · db_instance(Cloud SQL 인스턴스).
+      credentials_ref 는 서비스 계정 키 JSON 이름표, 비우면 서버의 ADC 로그인을 씁니다.
+    - Azure: subscription_id · resource_group · app_name(Container App) · db_instance(Flexible Server).
+      credentials_ref 는 {tenant_id, client_id, client_secret} 이름표 (필수).
+    """
+
+    region: str  # GCP 리전 / Azure 위치. 예: "asia-northeast3", "koreacentral"
+    app_name: str
+    db_instance: str
+    credentials_ref: str | None = None
+    project_id: str | None = None  # GCP
+    subscription_id: str | None = None  # Azure
+    resource_group: str | None = None  # Azure
+
+    @field_validator("region", "app_name", "db_instance", "project_id", "subscription_id", "resource_group")
+    @classmethod
+    def _url_safe_name(cls, value: str | None) -> str | None:
+        """클라우드 API 주소 경로에 그대로 들어가는 값이라 /·?·#·% 와 공백, '.'·'..' 은 받지 않습니다."""
+        if value is None:
+            return value
+        if not value or value in (".", "..") or re.search(r"[/?#\%\s]", value):
+            raise ValueError("이름에는 / ? # % 공백을 쓸 수 없고 비어 있거나 '.'·'..' 일 수 없습니다")
+        return value
+
+    @field_validator("credentials_ref")
+    @classmethod
+    def _ref_shape(cls, value: str | None) -> str | None:
+        """비우면 GCP 는 서버 로그인(ADC)을 씁니다. 값이 있으면 secret://… 이름표여야 하고, 아니면 거부합니다."""
+        if value is None or value == "":
+            return None
+        if not value.startswith("secret://"):
+            raise ValueError("credentials_ref 는 secret://… 이름표여야 합니다 (비우면 GCP 는 서버 로그인을 씁니다)")
+        return value
+
+
 class AssessmentInput(BaseModel):
     """workflows → assessment. 비밀은 원문이 아니라 이름표(secret://...)만 받습니다.
 
     source_kind 로 원본을 읽는 방법을 고릅니다. 어느 쪽이든 결과(AssessmentOutput)는 같은 형식입니다.
     - "aws"(기본): AWS 계정을 조회합니다. aws_credentials_ref · aws_region 이 필요합니다.
-    - "gcp" · "azure": 해당 클라우드의 관리형 PostgreSQL 을 조회합니다 (db_instance_id 등).
     - "manual": 사람이 입력한 manual 값으로 만듭니다. 원본에서 확인한 값이 아니라 gaps 에 남깁니다.
+    - "gcp" / "azure": cloud_source 위치의 앱·DB 를 클라우드 API 로 조회합니다 (cloud_source.py).
+      db_instance_id 를 주면 관리형 PostgreSQL 을 중계 VM 으로 읽는 경로(db.py: gcp_sql · azure_pg)를 쓸 수 있습니다.
     """
 
     run_id: str | None = None
-    source_kind: Literal["aws", "gcp", "azure", "manual"] = "aws"
+    source_kind: Literal["aws", "manual", "gcp", "azure"] = "aws"
     github_repo_url: str | None = None
     aws_credentials_ref: str | None = None  # 원본 AWS 키 이름표. source_kind="aws" 면 필수
     db_admin_ref: str | None = None  # 원본 DB 관리자 계정 이름표 (db.py 가 PG 카탈로그 조회에 씀)
     aws_region: str | None = None  # 원본 AWS 리전. 예: "ap-northeast-2". source_kind="aws" 면 필수
     target_region: str  # 목적지 리전. 예: "asia-northeast3"
+    target_cloud: TargetCloud = "gcp"  # 목적지 클라우드. workflows 의 target_infra.provider 와 같은 값
     manual: ManualSource | None = None  # source_kind="manual" 이면 필수
+    cloud_source: CloudSource | None = None  # source_kind="gcp"·"azure" 면 필수
     # 원본 계정에 후보가 여러 개일 때만 지정. 비우면 하나뿐일 때 자동으로 고릅니다.
     ecs_cluster: str | None = None
     ecs_service: str | None = None
@@ -246,8 +305,20 @@ class AssessmentInput(BaseModel):
             missing = [n for n in ("aws_credentials_ref", "aws_region") if not getattr(self, n)]
             if missing:
                 raise ValueError(f"source_kind=aws 에는 {', '.join(missing)} 가 필요합니다")
-        elif self.source_kind == "manual" and self.manual is None:
-            raise ValueError("source_kind=manual 에는 manual 이 필요합니다")
+        elif self.source_kind == "manual":
+            if self.manual is None:
+                raise ValueError("source_kind=manual 에는 manual 이 필요합니다")
+        elif self.cloud_source is None:
+            # db_instance_id 로 DB 만 읽는 경로(db.py)는 cloud_source 없이도 입력으로 받는다
+            if not (self.db_instance_id or self.rds_instance_id):
+                raise ValueError(f"source_kind={self.source_kind} 에는 cloud_source 가 필요합니다")
+        else:
+            src = self.cloud_source
+            need = ("project_id",) if self.source_kind == "gcp" else ("subscription_id", "resource_group",
+                                                                     "credentials_ref")
+            missing = [n for n in need if not getattr(src, n)]
+            if missing:
+                raise ValueError(f"source_kind={self.source_kind} 의 cloud_source 에 {', '.join(missing)} 가 필요합니다")
         return self
 
 

@@ -9,6 +9,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import threading
@@ -21,7 +22,7 @@ from .context import RunAborted
 from .engine import CUTOVER_ON_SOURCE, CUTOVER_OUTCOME, StageRunner
 from .prober import ProbedContext, prober_from_env
 from .schemas import RunContext, RunStatus, StageName, WorkflowState
-from .target_adapters import adapter_for
+from .target_adapters import adapter_for, provider_of
 
 log = logging.getLogger(__name__)
 
@@ -411,7 +412,8 @@ def run_assessment(run: RunStatus, ctx: RunContext) -> Any:
     # assessment 가 discovery·planning 을 합친 모듈입니다 (PR #27). 출력은 {source, plan, gaps}.
     req = run.request
     manual = req.source_kind == "manual"
-    if not manual and not req.aws_credentials_ref:
+    cloud = req.source_kind in ("gcp", "azure")
+    if req.source_kind == "aws" and not req.aws_credentials_ref:
         raise MissingStageOutput("원본 AWS 키 이름표가 없습니다")
 
     try:
@@ -420,6 +422,8 @@ def run_assessment(run: RunStatus, ctx: RunContext) -> Any:
     except ImportError as exc:
         raise RuntimeError("assessment 모듈을 찾을 수 없습니다") from exc
 
+    # 목적지 클라우드에 맞춰 호환 검사·안내 문구를 고르게 합니다 (assessment targets.py)
+    target_cloud = req.target_infra.provider if req.target_infra else "gcp"
     if manual:
         # 직접 입력한 원본은 AWS 를 조회하지 않습니다. 원본에서 확인하지 않은 값이라는 표시는 assessment 가 gaps 에 남깁니다.
         inp = AssessmentInput(
@@ -428,6 +432,17 @@ def run_assessment(run: RunStatus, ctx: RunContext) -> Any:
             manual=req.manual,
             github_repo_url=req.github_repo_url,
             target_region=req.target_region,
+            target_cloud=target_cloud,
+        )
+    elif cloud:
+        inp = AssessmentInput(
+            run_id=run.run_id,
+            source_kind=req.source_kind,
+            cloud_source=req.cloud_source,
+            db_admin_ref=req.db_admin_ref or req.db_credentials_ref,
+            github_repo_url=req.github_repo_url,
+            target_region=req.target_region,
+            target_cloud=target_cloud,
         )
     else:
         inp = AssessmentInput(
@@ -437,6 +452,7 @@ def run_assessment(run: RunStatus, ctx: RunContext) -> Any:
             db_admin_ref=req.db_admin_ref or req.db_credentials_ref,
             aws_region=req.aws_region,
             target_region=req.target_region,
+            target_cloud=target_cloud,
             ecs_service=req.ecs_service,
             rds_instance_id=req.rds_instance_id,
         )
@@ -461,9 +477,46 @@ def _check_cdc_settings() -> None:
     OciSettings.from_env()
 
 
+ALLOW_SAME_ACCOUNT_ENV = "ALLOW_SAME_ACCOUNT_TARGET"
+
+
+def _extract_source_account_id(run: RunStatus) -> str | None:
+    """조사 출력의 원본 AWS 계정 ID(source.account_id). 없으면 None."""
+    planning_out = run.outputs.get(StageName.PLANNING.value) or {}
+    source = planning_out.get("source")
+    if hasattr(source, "model_dump"):
+        source = source.model_dump()
+    account = source.get("account_id") if isinstance(source, dict) else None
+    return str(account) if account else None
+
+
+def _check_target_account(run: RunStatus) -> None:
+    """AWS 목적지 계정이 원본 계정과 같으면 Terraform 을 시작하기 전에 거부합니다.
+
+    같은 계정에 목적지를 만들면 이름(ECR 저장소, IAM 역할 등)이 원본과 겹쳐 실패하거나 원본 계정에 자원이 섞입니다.
+    Terraform 의 allowed_account_ids 는 '입력한 값'과 '실행 환경 로그인'만 비교하므로 원본 계정은 여기서 비교합니다.
+    계정이 하나뿐인 시연 환경에서는 환경변수 ALLOW_SAME_ACCOUNT_TARGET=1 로 명시해야 통과합니다.
+    원본 계정을 알 수 없으면(직접 입력 등) 비교하지 않습니다.
+    """
+    if provider_of(run.request) != "aws":
+        return
+    config = run.request.target_infra
+    target = (config.project_id if config else None) or os.getenv("AWS_ACCOUNT_ID")
+    source = _extract_source_account_id(run)
+    if not target or not source or str(target).strip() != source:
+        return
+    if os.getenv(ALLOW_SAME_ACCOUNT_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        return
+    raise RuntimeError(
+        f"목적지 AWS 계정({target})이 원본 계정과 같습니다. 같은 계정에 만들면 이름이 겹치거나 원본 계정에 자원이 섞일 수 있어 "
+        f"시작하지 않았습니다. 다른 계정 ID 를 지정하세요. 같은 계정에 만들려면 환경변수 {ALLOW_SAME_ACCOUNT_ENV}=1 을 설정하세요"
+    )
+
+
 def run_provisioning(run: RunStatus, ctx: RunContext) -> Any:
     # planning 출력의 target_infra 로 목적지 인프라(VPC, Cloud SQL)를 프로비저닝합니다 (PR #40).
     target_infra = _extract_plan_target_infra(run)
+    _check_target_account(run)
     _check_cdc_settings()
     res = adapter_for(run.request).provision(run.run_id, target_infra, run.request.target_infra, ctx)
     metrics = _private_ip_metric(res)
@@ -509,6 +562,33 @@ def clean_up_cdc(run: RunStatus) -> bool:
 
     db_migration_service.stop(run.run_id, agent=agent)
     return True
+
+
+def decommission_cdc(run: RunStatus) -> str:
+    """전환이 끝난 run 의 이전 자원을 db_workflow.finish 로 정리합니다 (에이전트 작업 종료 → 복제 슬롯 정리 → VPN 삭제).
+
+    남겨 두면 VPN 연결과 CDC 서버가 매달 청구되고, 원본 복제 슬롯이 WAL 을 계속 붙잡습니다.
+    끝나면 사람에게 보일 문장을, 남은 항목이 있으면 그 이름과 함께 예외를 냅니다 (다시 부를 수 있음).
+    전환 단계·작업 단계 확인(stabilizing 또는 closed)은 db_workflow.finish 가 합니다.
+    """
+    stage = run.stage(StageName.DB_MIGRATION)
+    if stage.manual or stage.state == WorkflowState.PENDING:
+        return "DB 이전을 수동으로 기록한 run 이라 자동으로 정리할 복제 자원이 없습니다. 직접 만든 자원은 직접 지우세요"
+
+    from app.features.db_migration import db_workflow
+    from app.features.db_migration.client import AgentSettings, CdcAgentClient
+
+    try:
+        settings = AgentSettings.from_env()
+    except KeyError:
+        raise RuntimeError("CDC_AGENT_URL 이 없어 이전 자원을 정리하지 못했습니다") from None
+    result = db_workflow.finish(run.run_id, agent=CdcAgentClient(settings))
+    if result.state != "finished":
+        left = ", ".join(result.remaining) or "확인 필요"
+        detail = f" ({result.message})" if result.message else ""
+        raise RuntimeError(f"남은 항목: {left}{detail}. 다시 시도하세요")
+    vpn = "VPN 삭제" if result.vpn == "removed" else "VPN 남음"
+    return " ".join([f"이전 자원 정리 완료: 복제 작업 종료, {vpn}.", *result.next_steps])
 
 
 def _cdc_end_reason(result: Any) -> str | None:
@@ -570,6 +650,10 @@ def run_db_migration(
         "target": dict(target),
     }
 
+    if os.getenv("CDC_USE_EXISTING_VPN", "0") in ("1", "true", "True"):
+        # 팀이 미리 띄운 VPN 으로 원본·대상이 이미 닿을 때. probe 가 실패하면 바로 멈춥니다.
+        inp["options"] = {"skip_vpn": True}
+
     if _agent_is_simulated():
         # 모의 에이전트로 실제 VPN 을 만들지 않습니다. 화면에는 simulated 지표로 구분됩니다.
         inp["options"] = {"skip_vpn": True}
@@ -600,6 +684,16 @@ def run_db_migration(
                     latest_phase[0] = phase
                     if phase in APP_DEPLOY_PHASES:
                         ready_event.set()
+                lag = forwarded.get("replication_lag_bytes")
+                if lag is not None and isinstance(lag, (int, float)):
+                    try:
+                        from app.features.provisioning.worker_client import WorkerClient
+
+                        worker = WorkerClient.from_env()
+                        if worker is not None:
+                            worker.sync_lag(int(lag))
+                    except Exception:
+                        pass
             if ctx is not None and not run_aborted.is_set():
                 # db_migration/service.py 가 종료 시점에 ctx.report("failed", ...) 또는 ctx.report("stopped", ...) 를 호출할 수 있습니다.
                 # workflows 규격상 완료/실패는 runner 반환 및 예외로 판정하므로, reportable 상태일 때만 forward 합니다.
