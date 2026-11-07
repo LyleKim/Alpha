@@ -14,14 +14,21 @@ services:
               "-c", "ssl=on", "-c", "ssl_cert_file=/tmp/server.crt", "-c", "ssl_key_file=/tmp/server.key"]
     volumes: [pgdata:/var/lib/postgresql/data, ./certs:/certs:ro]
     networks: [back]
+    healthcheck:   # docker compose up --wait 가 준비될 때까지 기다리게 한다
+      test: ["CMD-SHELL", "pg_isready -U alpha_admin -d appdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.10.7   # 데모 재현을 위해 고정(PoC 때 확인한 버전)
     restart: unless-stopped
     # 토큰은 인자가 아니라 환경변수로 넘긴다(프로세스 목록·docker inspect 의 명령줄에 남지 않게)
     environment:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:?.env에 TUNNEL_TOKEN 필요}
     command: tunnel --no-autoupdate run
-    depends_on: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks: [back, front]   # DB와 외부(front)를 잇는 유일한 컨테이너
 volumes:
   pgdata:
