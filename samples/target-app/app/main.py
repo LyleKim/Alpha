@@ -4,6 +4,7 @@ This is the service the platform migrates (AWS ECS Fargate + RDS -> GCP).
 No login, cache, queue, or file upload by design.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from pydantic import BaseModel, Field
 from app import db
 
 SERVED_BY = os.getenv("APP_ENV", "local")
+WORKER_SECRET_HEADER = "x-alpha-worker-secret"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COLUMNS = "id, title, description, status, created_at, updated_at"
 
@@ -61,6 +63,43 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="target-app", version="0.1.0", lifespan=lifespan)
+
+
+# Declared before request_log so that request_log wraps it and blocked requests are logged too.
+@app.middleware("http")
+async def verify_proxy_secret(request: Request, call_next):
+    """Accept only requests that came through the Cloudflare Worker (#34).
+
+    - WORKER_SECRET set: the request must carry the same value in the proxy header.
+    - REQUIRE_WORKER_SECRET=true and no WORKER_SECRET: every request is refused (fail-closed).
+      Turn this on only where the Worker sends the header (the target, not the AWS source).
+    - Neither set (local, AWS source): the check is off.
+
+    /health/* stays open because Cloud Run probes and the platform call it directly.
+    """
+    if request.url.path.startswith("/health/"):
+        return await call_next(request)
+
+    required = os.getenv("REQUIRE_WORKER_SECRET", "").lower() in ("1", "true", "yes")
+    expected = os.getenv("WORKER_SECRET")
+
+    if not expected:
+        if required:
+            return Response(
+                content=json.dumps({"detail": "Server configuration error: WORKER_SECRET is required when REQUIRE_WORKER_SECRET is enabled."}),
+                status_code=403,
+                media_type="application/json",
+            )
+        return await call_next(request)
+
+    token = request.headers.get(WORKER_SECRET_HEADER, "")
+    if not hmac.compare_digest(token.encode(), expected.encode()):
+        return Response(
+            content=json.dumps({"detail": "Direct access forbidden. Requests must pass through Cloudflare Worker."}),
+            status_code=403,
+            media_type="application/json",
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")
