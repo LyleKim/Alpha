@@ -188,6 +188,7 @@ def test_deploy_preserves_target_except_url_and_no_secrets_in_output_or_state(se
         and runtime.env["PGPASSWORD"] == "app-sentinel"
     )
     assert worker.targets == ["https://app.example.com"]
+    assert out.ingress_guard == "SECURE"
     text = (
         out.model_dump_json() + (Path(setup[0]["directory"]) / "state.json").read_text()
     )

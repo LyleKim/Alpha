@@ -43,7 +43,13 @@ OCI 노드에는 이미 같은 DB 호스트명과 서비스 토큰으로 인증�
 
 기존 DB 모듈은 동일 원본 DB에 대해 다른 활성 마이그레이션 작업이 있으면 새 실행을 거절한다. 현재 실험용 작업이 남아 있다면 소유자와 상태·정리 범위를 확인하고 정리한 뒤 전체 워크플로를 실행해야 한다. 이 구현은 기존 작업을 자동 중단하지 않는다.
 
+Worker 목적지 등록을 생략한 배포는 앱 검증까지 진행할 수 있지만, main의 온프렘 전환 단계는 worker_target_updated=true가 확인되어야 시작한다.
+
 Worker에는 이 목적지 호스트를 허용하도록 TARGET_ALLOWED_SUFFIXES를 사전 설정하고 WORKER_SECRET을 맞춰 둔다. 기존 AWS/GCP 이전 작업이 이 Worker를 사용 중이면 목적지 등록이 간섭하므로 같은 Worker를 공유한 병행 전환은 금지한다.
+
+## 운영 설정과 UI 선택
+
+운영자가 `ONPREM_CONFIG_REF=secret://onprem/config`를 등록하면 요청에는 `target_infra: {"provider": "onprem"}`만 전달할 수 있다. 배포 경로·터널·계정은 이 참조에서 읽는다. 요청의 `extra_params.onprem_config_ref`가 있으면 운영 기본값보다 우선한다. 실제 환경값은 예시에 고정하지 않는다.
 
 ## Secret 등록과 실행 요청
 

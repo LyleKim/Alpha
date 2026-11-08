@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.features.workflows import runners, target_adapters
 from app.features.workflows.schemas import MigrationRequest, TargetInfraConfig
 from app.features.provisioning.onprem import service
@@ -51,7 +53,8 @@ def test_registered_adapter_forwards_existing_arguments_and_reference(monkeypatc
     assert called["config_ref"] == "secret://config"
 
 
-def test_runner_passes_target_unchanged_and_selects_onprem_vpn(monkeypatch):
+@pytest.mark.parametrize("existing_vpn", [False, True])
+def test_runner_passes_target_unchanged_and_selects_onprem_vpn(monkeypatch, existing_vpn):
     from app.features.db_migration import service as db_service
 
     captured = {}
@@ -62,7 +65,8 @@ def test_runner_passes_target_unchanged_and_selects_onprem_vpn(monkeypatch):
         return {"state": "streaming", "phase": "streaming", "job_id": "run_1"}
 
     monkeypatch.setattr(db_service, "run", run)
-    monkeypatch.setattr(runners, "_agent_is_simulated", lambda: False)
+    monkeypatch.setattr(runners, "_require_real_agent", lambda: None)
+    monkeypatch.setattr(runners, "_use_existing_vpn", lambda: existing_vpn)
     request = MigrationRequest(
         service_name="app",
         aws_region="ap-northeast-2",
@@ -79,5 +83,37 @@ def test_runner_passes_target_unchanged_and_selects_onprem_vpn(monkeypatch):
     result = runners.run_db_migration(run, None, poll_interval_s=0.001, timeout_s=1)
     assert result["state"] == "streaming"
     assert captured["target"] == TARGET
-    assert captured["options"] == {"pass_onprem": True}
+    assert captured["options"] == ({"pass_onprem": True, "skip_vpn": True} if existing_vpn else {"pass_onprem": True})
     assert captured["source"]["tables"] == ["public.work_items"]
+
+
+def test_onprem_selection_uses_operator_config_without_extra_ui_fields(monkeypatch):
+    monkeypatch.setenv("ONPREM_CONFIG_REF", "secret://operator/onprem")
+    request = MigrationRequest(service_name="app", aws_region="ap-northeast-2", target_infra={"provider": "onprem"})
+    adapter = target_adapters.adapter_for(request)
+    assert adapter._ref(request.target_infra) == "secret://operator/onprem"
+
+
+def test_missing_operator_config_fails_before_provisioning(monkeypatch):
+    monkeypatch.delenv("ONPREM_CONFIG_REF", raising=False)
+    request = MigrationRequest(service_name="app", aws_region="ap-northeast-2", target_infra={"provider": "onprem"})
+    with pytest.raises(target_adapters.UnsupportedTarget, match="ONPREM_CONFIG_REF"):
+        target_adapters.adapter_for(request).provision("run-1", {}, request.target_infra, None)
+
+
+@pytest.mark.parametrize("output", [{}, {"worker_target_updated": False}])
+def test_onprem_cannot_cutover_without_worker_target_registration(output):
+    request = MigrationRequest(service_name="app", aws_region="ap-northeast-2", target_infra={"provider": "onprem"})
+    run = SimpleNamespace(request=request, outputs={"app_deploy": output})
+    with pytest.raises(RuntimeError, match="Worker 목적지 등록"):
+        runners.run_cutover(run, None)
+
+
+def test_planning_recognizes_onprem_without_claiming_cloud_terraform():
+    from app.features.assessment.schemas import TargetSelection
+    from app.features.assessment import rules, targets
+    assert TargetSelection(cloud="onprem", region="local").cloud == "onprem"
+    assert targets.profile("onprem").app_platform == "Docker WAS"
+    steps = rules.build_steps(cloud="onprem")
+    assert any("Docker Compose" in step.action for step in steps)
+    assert not any("terraform apply" in step.action for step in steps)

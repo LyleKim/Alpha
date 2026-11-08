@@ -268,4 +268,5 @@ def deploy_app(
             },
             applied=True,
             worker_target_updated=updated,
+            ingress_guard="SECURE",
         )

@@ -451,7 +451,7 @@ def run_assessment(run: RunStatus, ctx: RunContext) -> Any:
             source_kind="manual",
             manual=req.manual,
             github_repo_url=req.github_repo_url,
-            target_region=req.target_region,
+            target_region=("local" if target_cloud == "onprem" else req.target_region),
             target_cloud=target_cloud,
         )
     elif cloud:
@@ -461,7 +461,7 @@ def run_assessment(run: RunStatus, ctx: RunContext) -> Any:
             cloud_source=req.cloud_source,
             db_admin_ref=req.db_admin_ref or req.db_credentials_ref,
             github_repo_url=req.github_repo_url,
-            target_region=req.target_region,
+            target_region=("local" if target_cloud == "onprem" else req.target_region),
             target_cloud=target_cloud,
         )
     else:
@@ -471,7 +471,7 @@ def run_assessment(run: RunStatus, ctx: RunContext) -> Any:
             aws_credentials_ref=req.aws_credentials_ref,
             db_admin_ref=req.db_admin_ref or req.db_credentials_ref,
             aws_region=req.aws_region,
-            target_region=req.target_region,
+            target_region=("local" if target_cloud == "onprem" else req.target_region),
             target_cloud=target_cloud,
             ecs_service=req.ecs_service,
             rds_instance_id=req.rds_instance_id,
@@ -493,9 +493,6 @@ def _check_cdc_settings() -> None:
         AgentSettings.from_env()
     except KeyError:
         raise RuntimeError("CDC_AGENT_URL 환경변수가 설정되지 않아 CDC 를 시작할 수 없습니다") from None
-    if adapter_for(run.request).provider == "onprem":
-        inp["options"] = {"pass_onprem": True}
-
     _require_real_agent()
     if _use_existing_vpn():
         return  # VPN 을 미리 띄웠으면 OCI 로 VPN 을 만들지 않으므로 OCI 설정이 필요 없습니다.
@@ -682,6 +679,9 @@ def run_db_migration(
         "target": dict(target),
     }
 
+    if adapter_for(run.request).provider == "onprem":
+        inp["options"] = {"pass_onprem": True}
+
     _require_real_agent()
     if _use_existing_vpn():
         # 팀이 미리 띄운 VPN 으로 원본·대상이 이미 닿을 때. probe 가 실패하면 바로 멈춥니다.
@@ -839,6 +839,11 @@ def run_cutover(
     쓰기 실패 수를 잽니다. 모의(mock) 에이전트 주소는 프로버·Worker 를 켜기 전에 설정 오류로 거부합니다.
     측정은 전환 직후에 끝납니다. 비교는 오래 걸릴 수 있고 전환 시간과 상관이 없습니다.
     """
+    request = getattr(run, "request", None)
+    if request is not None and adapter_for(request).provider == "onprem":
+        deployed = run.outputs.get(StageName.APP_DEPLOY.value) or {}
+        if deployed.get("worker_target_updated") is not True:
+            raise RuntimeError("온프렘 WAS의 Worker 목적지 등록이 확인되지 않아 전환을 시작하지 않습니다")
     _require_real_agent()
     prober = prober_from_env()
     worker = _cutover_worker()
